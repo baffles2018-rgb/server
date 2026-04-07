@@ -42,7 +42,7 @@ db.exec(`
 function requireApiKey(req, res, next) {
   const providedKey = String(req.header("x-api-key") || "").trim();
 
-  if (!providedKey || providedKey ~= API_KEY) {
+  if (!providedKey || providedKey !== API_KEY) {
     return res.status(401).json({
       success: false,
       message: "Unauthorized"
