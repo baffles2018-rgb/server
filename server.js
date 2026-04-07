@@ -1,39 +1,55 @@
 const express = require("express");
-const fs = require("fs");
 const path = require("path");
+const Database = require("better-sqlite3");
 
 const app = express();
 app.use(express.json());
 
-const DB_PATH = path.join(__dirname, "database.json");
+const PORT = process.env.PORT || 3000;
+const API_KEY = String(process.env.API_KEY || "").trim();
+const DB_PATH = path.resolve(process.env.DB_PATH || "./donations.db");
 
-function readDatabase() {
-  try {
-    if (!fs.existsSync(DB_PATH)) {
-      return { donations: [] };
-    }
-
-    const raw = fs.readFileSync(DB_PATH, "utf8");
-    const parsed = JSON.parse(raw);
-
-    if (!parsed.donations || !Array.isArray(parsed.donations)) {
-      return { donations: [] };
-    }
-
-    return parsed;
-  } catch (error) {
-    console.error("Failed to read database:", error.message);
-    return { donations: [] };
-  }
+if (!API_KEY) {
+  console.error("Missing API_KEY environment variable.");
+  process.exit(1);
 }
 
-function writeDatabase(data) {
-  try {
-    fs.writeFileSync(DB_PATH, JSON.stringify(data, null, 2), "utf8");
-  } catch (error) {
-    console.error("Failed to write database:", error.message);
-    throw error;
+const db = new Database(DB_PATH);
+
+db.pragma("journal_mode = WAL");
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS donations (
+    id TEXT PRIMARY KEY,
+    fromUserId INTEGER NOT NULL,
+    fromUsername TEXT NOT NULL,
+    toUserId INTEGER NOT NULL,
+    toUsername TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    gameId INTEGER NOT NULL DEFAULT 0,
+    placeId INTEGER NOT NULL DEFAULT 0,
+    purchaseId TEXT,
+    timestamp TEXT NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_donations_timestamp ON donations(timestamp DESC);
+  CREATE INDEX IF NOT EXISTS idx_donations_gameId ON donations(gameId);
+  CREATE INDEX IF NOT EXISTS idx_donations_fromUserId ON donations(fromUserId);
+  CREATE INDEX IF NOT EXISTS idx_donations_toUserId ON donations(toUserId);
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_donations_purchaseId ON donations(purchaseId);
+`);
+
+function requireApiKey(req, res, next) {
+  const providedKey = String(req.header("x-api-key") || "").trim();
+
+  if (!providedKey || providedKey !== API_KEY) {
+    return res.status(401).json({
+      success: false,
+      message: "Unauthorized"
+    });
   }
+
+  next();
 }
 
 async function fetchJson(url) {
@@ -114,7 +130,7 @@ function startOfTodayUTC() {
 function startOfWeekUTC() {
   const now = new Date();
   const day = now.getUTCDay();
-  const diff = day === 0 ? 6 : day - 1;
+  const diff = day === 0 ? 6 : day - 1; // Monday start
   const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
   start.setUTCDate(start.getUTCDate() - diff);
   return start;
@@ -128,16 +144,16 @@ function filterByPeriod(items, period) {
   let cutoff = null;
 
   if (period === "today") {
-    cutoff = startOfTodayUTC();
+    cutoff = startOfTodayUTC().toISOString();
   } else if (period === "week") {
-    cutoff = startOfWeekUTC();
+    cutoff = startOfWeekUTC().toISOString();
   }
 
   if (!cutoff) {
     return items;
   }
 
-  return items.filter(item => new Date(item.timestamp) >= cutoff);
+  return items.filter(item => item.timestamp >= cutoff);
 }
 
 function buildDonationLeaderboard(donations, type) {
@@ -161,6 +177,30 @@ function buildDonationLeaderboard(donations, type) {
 
   return Array.from(map.values()).sort((a, b) => b.amount - a.amount);
 }
+
+function getAllDonations(gameId) {
+  if (Number.isFinite(gameId)) {
+    return db.prepare(`
+      SELECT *
+      FROM donations
+      WHERE gameId = ?
+      ORDER BY timestamp DESC
+    `).all(gameId);
+  }
+
+  return db.prepare(`
+    SELECT *
+    FROM donations
+    ORDER BY timestamp DESC
+  `).all();
+}
+
+app.get("/", (req, res) => {
+  return res.json({
+    success: true,
+    message: "Backend is running"
+  });
+});
 
 app.get("/roblox-passes", async (req, res) => {
   try {
@@ -211,6 +251,8 @@ app.get("/roblox-passes", async (req, res) => {
       }
     }
 
+    passItems.sort((a, b) => a.PassId - b.PassId);
+
     return res.json({
       success: true,
       items: passItems
@@ -225,7 +267,7 @@ app.get("/roblox-passes", async (req, res) => {
   }
 });
 
-app.post("/donations", (req, res) => {
+app.post("/donations", requireApiKey, (req, res) => {
   try {
     const {
       fromUserId,
@@ -234,14 +276,22 @@ app.post("/donations", (req, res) => {
       toUsername,
       amount,
       gameId,
-      placeId
+      placeId,
+      purchaseId
     } = req.body || {};
 
+    const donorId = Number(fromUserId);
+    const receiverId = Number(toUserId);
+    const donationAmount = Number(amount);
+    const parsedGameId = Number(gameId || 0);
+    const parsedPlaceId = Number(placeId || 0);
+    const normalizedPurchaseId = String(purchaseId || "").trim();
+
     if (
-      !Number.isFinite(Number(fromUserId)) ||
-      !Number.isFinite(Number(toUserId)) ||
-      !Number.isFinite(Number(amount)) ||
-      Number(amount) <= 0
+      !Number.isFinite(donorId) ||
+      !Number.isFinite(receiverId) ||
+      !Number.isFinite(donationAmount) ||
+      donationAmount <= 0
     ) {
       return res.status(400).json({
         success: false,
@@ -249,21 +299,66 @@ app.post("/donations", (req, res) => {
       });
     }
 
+    if (!normalizedPurchaseId) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing purchaseId"
+      });
+    }
+
+    const existing = db.prepare(`
+      SELECT id
+      FROM donations
+      WHERE purchaseId = ?
+      LIMIT 1
+    `).get(normalizedPurchaseId);
+
+    if (existing) {
+      return res.json({
+        success: true,
+        duplicate: true,
+        message: "Donation already recorded"
+      });
+    }
+
     const donation = {
       id: `don_${Date.now()}_${Math.floor(Math.random() * 1000000)}`,
-      fromUserId: Number(fromUserId),
+      fromUserId: donorId,
       fromUsername: String(fromUsername || "Unknown"),
-      toUserId: Number(toUserId),
+      toUserId: receiverId,
       toUsername: String(toUsername || "Unknown"),
-      amount: Number(amount),
-      gameId: Number(gameId || 0),
-      placeId: Number(placeId || 0),
+      amount: donationAmount,
+      gameId: Number.isFinite(parsedGameId) ? parsedGameId : 0,
+      placeId: Number.isFinite(parsedPlaceId) ? parsedPlaceId : 0,
+      purchaseId: normalizedPurchaseId,
       timestamp: new Date().toISOString()
     };
 
-    const db = readDatabase();
-    db.donations.push(donation);
-    writeDatabase(db);
+    db.prepare(`
+      INSERT INTO donations (
+        id,
+        fromUserId,
+        fromUsername,
+        toUserId,
+        toUsername,
+        amount,
+        gameId,
+        placeId,
+        purchaseId,
+        timestamp
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      donation.id,
+      donation.fromUserId,
+      donation.fromUsername,
+      donation.toUserId,
+      donation.toUsername,
+      donation.amount,
+      donation.gameId,
+      donation.placeId,
+      donation.purchaseId,
+      donation.timestamp
+    );
 
     return res.json({
       success: true,
@@ -284,14 +379,8 @@ app.get("/donations/recent", (req, res) => {
     const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 20));
     const gameId = req.query.gameId ? Number(req.query.gameId) : null;
 
-    const db = readDatabase();
-    let items = [...db.donations];
-
-    if (Number.isFinite(gameId)) {
-      items = items.filter(item => Number(item.gameId) === gameId);
-    }
-
-    items.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    let items = getAllDonations(gameId);
+    items.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
 
     return res.json({
       success: true,
@@ -320,13 +409,7 @@ app.get("/leaderboards/donators/:period", (req, res) => {
       });
     }
 
-    const db = readDatabase();
-    let items = [...db.donations];
-
-    if (Number.isFinite(gameId)) {
-      items = items.filter(item => Number(item.gameId) === gameId);
-    }
-
+    let items = getAllDonations(gameId);
     items = filterByPeriod(items, period);
 
     const leaderboard = buildDonationLeaderboard(items, "donated");
@@ -359,13 +442,7 @@ app.get("/leaderboards/raised/:period", (req, res) => {
       });
     }
 
-    const db = readDatabase();
-    let items = [...db.donations];
-
-    if (Number.isFinite(gameId)) {
-      items = items.filter(item => Number(item.gameId) === gameId);
-    }
-
+    let items = getAllDonations(gameId);
     items = filterByPeriod(items, period);
 
     const leaderboard = buildDonationLeaderboard(items, "raised");
@@ -385,7 +462,7 @@ app.get("/leaderboards/raised/:period", (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Listening on port ${PORT}`);
+  console.log(`Using SQLite database at: ${DB_PATH}`);
 });
