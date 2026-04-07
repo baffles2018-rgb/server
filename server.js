@@ -9,10 +9,9 @@ app.get("/roblox-passes", async (req, res) => {
 		return res.json({
 			success: true,
 			items: [
-				{ PassId: 1460493628 },
-				{ PassId: 110542510 },
-				{ PassId: 1106637191 },
-				{ PassId: 1107534668 }
+				{ PassId: 1460493628 }, // wat
+				{ PassId: 110542510 },  // do it
+				{ PassId: 1106637191 }  // do it if ur bad
 			]
 		});
 	}
