@@ -2,29 +2,13 @@ const express = require("express");
 
 const app = express();
 
-/*
-Render Environment Variables you need:
-ROBLOX_API_KEY=your_open_cloud_api_key
-
-Optional:
-PORT=3000
-
-This map is the part you edit for now.
-It tells the backend which universe IDs belong to which user.
-Later, you can move this to a database if you want.
-*/
-const USER_UNIVERSES = {
-  "5364064": [7365282196]
-};
-
-const ROBLOX_API_KEY = process.env.ROBLOX_API_KEY;
-
-if (!ROBLOX_API_KEY) {
-  console.warn("ROBLOX_API_KEY is missing. The backend will not work correctly.");
-}
-
-async function fetchJson(url, options = {}) {
-  const response = await fetch(url, options);
+async function fetchJson(url) {
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      "User-Agent": "Mozilla/5.0"
+    }
+  });
 
   if (!response.ok) {
     const text = await response.text().catch(() => "");
@@ -34,34 +18,58 @@ async function fetchJson(url, options = {}) {
   return response.json();
 }
 
-async function listGamePassesByUniverse(universeId) {
-  const allItems = [];
-  let pageToken = "";
+async function getUserGames(userId) {
+  let cursor = "";
+  const allGames = [];
 
   while (true) {
     const url =
-      `https://apis.roblox.com/game-passes/v1/universes/${universeId}/game-passes/creator` +
-      (pageToken ? `?pageToken=${encodeURIComponent(pageToken)}` : "");
+      `https://games.roproxy.com/v2/users/${encodeURIComponent(userId)}/games` +
+      `?accessFilter=2&limit=50&sortOrder=Asc` +
+      (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
 
-    const data = await fetchJson(url, {
-      method: "GET",
-      headers: {
-        "x-api-key": ROBLOX_API_KEY,
-        "Content-Type": "application/json"
-      }
-    });
+    const data = await fetchJson(url);
+    const items = Array.isArray(data.data) ? data.data : [];
+    allGames.push(...items);
 
-    const items = Array.isArray(data.gamePasses) ? data.gamePasses : [];
-    allItems.push(...items);
-
-    if (!data.nextPageToken) {
+    if (!data.nextPageCursor) {
       break;
     }
 
-    pageToken = data.nextPageToken;
+    cursor = data.nextPageCursor;
   }
 
-  return allItems;
+  return allGames;
+}
+
+async function getUniversePasses(universeId) {
+  let cursor = "";
+  const allPasses = [];
+
+  while (true) {
+    const url =
+      `https://apis.roproxy.com/game-passes/v1/universes/${encodeURIComponent(universeId)}/game-passes` +
+      `?limit=100&sortOrder=Asc` +
+      (cursor ? `&pageToken=${encodeURIComponent(cursor)}` : "");
+
+    const data = await fetchJson(url);
+
+    const items =
+      Array.isArray(data.gamePasses) ? data.gamePasses :
+      Array.isArray(data.data) ? data.data :
+      [];
+
+    allPasses.push(...items);
+
+    const nextToken = data.nextPageToken || data.nextPageCursor || "";
+    if (!nextToken) {
+      break;
+    }
+
+    cursor = nextToken;
+  }
+
+  return allPasses;
 }
 
 app.get("/roblox-passes", async (req, res) => {
@@ -75,42 +83,50 @@ app.get("/roblox-passes", async (req, res) => {
       });
     }
 
-    const universeIds = USER_UNIVERSES[userId] || [];
+    const games = await getUserGames(userId);
 
-    if (universeIds.length === 0) {
-      return res.json({
-        success: true,
-        items: []
-      });
-    }
+    const seenUniverseIds = new Set();
+    const seenPassIds = new Set();
+    const passItems = [];
 
-    const seen = new Set();
-    const results = [];
+    for (const game of games) {
+      const universeId = Number(game.id || game.rootPlace?.universeId || game.universeId);
 
-    for (const universeId of universeIds) {
-      const gamePasses = await listGamePassesByUniverse(universeId);
+      if (!Number.isFinite(universeId) || seenUniverseIds.has(universeId)) {
+        continue;
+      }
 
-      for (const pass of gamePasses) {
-        const passId = Number(pass.path ? pass.path.split("/").pop() : pass.id);
+      seenUniverseIds.add(universeId);
 
-        if (!Number.isFinite(passId) || seen.has(passId)) {
-          continue;
+      try {
+        const passes = await getUniversePasses(universeId);
+
+        for (const pass of passes) {
+          const passId = Number(
+            pass.id ||
+            pass.gamePassId ||
+            pass.passId ||
+            (typeof pass.path === "string" ? pass.path.split("/").pop() : 0)
+          );
+
+          if (!Number.isFinite(passId) || seenPassIds.has(passId)) {
+            continue;
+          }
+
+          seenPassIds.add(passId);
+          passItems.push({ PassId: passId });
         }
-
-        seen.add(passId);
-
-        results.push({
-          PassId: passId
-        });
+      } catch (err) {
+        console.error(`Failed to fetch passes for universe ${universeId}:`, err.message);
       }
     }
 
     return res.json({
       success: true,
-      items: results
+      items: passItems
     });
   } catch (error) {
-    console.error("roblox-passes error:", error);
+    console.error("roblox-passes error:", error.message);
 
     return res.status(500).json({
       success: false,
