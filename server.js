@@ -9,16 +9,20 @@ const PORT = process.env.PORT || 3000;
 const API_KEY = String(process.env.API_KEY || "").trim();
 const DB_PATH = path.resolve(process.env.DB_PATH || "./donations.db");
 
+/*
+  Node 18+ required for global fetch.
+  Optional envs:
+  - CATALOG_BASE_URL=https://catalog.roproxy.com
+  - GAMES_BASE_URL=https://games.roproxy.com
+  - PASSES_BASE_URL=https://apis.roproxy.com
+  - ROBLOX_CREATOR_NAME=Roblox
+  - ROBLOX_CREATOR_ID=1
+*/
 const CATALOG_BASE_URL = String(process.env.CATALOG_BASE_URL || "https://catalog.roproxy.com").replace(/\/+$/, "");
 const GAMES_BASE_URL = String(process.env.GAMES_BASE_URL || "https://games.roproxy.com").replace(/\/+$/, "");
 const PASSES_BASE_URL = String(process.env.PASSES_BASE_URL || "https://apis.roproxy.com").replace(/\/+$/, "");
 const ROBLOX_CREATOR_NAME = String(process.env.ROBLOX_CREATOR_NAME || "Roblox").trim();
 const ROBLOX_CREATOR_ID = Number(process.env.ROBLOX_CREATOR_ID || 1);
-
-const CATALOG_CACHE_TTL_MS = 60 * 1000;
-const ITEM_CACHE_TTL_MS = 5 * 60 * 1000;
-const catalogCache = new Map();
-const itemCache = new Map();
 
 if (!global.fetch) {
   console.error("This backend requires Node 18+ because it uses the built-in fetch API.");
@@ -67,72 +71,21 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-async function fetchJson(url, options = {}) {
-  const {
-    timeoutMs = 10000,
-    retries = 1
-  } = options;
-
-  let lastError = null;
-
-  for (let attempt = 0; attempt <= retries; attempt += 1) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-    try {
-      const response = await fetch(url, {
-        method: "GET",
-        headers: {
-          "User-Agent": "Mozilla/5.0 CatalogBackend/2.0",
-          "Accept": "application/json"
-        },
-        signal: controller.signal
-      });
-
-      clearTimeout(timer);
-
-      if (!response.ok) {
-        const text = await response.text().catch(() => "");
-        throw new Error(`HTTP ${response.status} for ${url}: ${text}`);
-      }
-
-      return await response.json();
-    } catch (error) {
-      clearTimeout(timer);
-      lastError = error;
-
-      if (attempt < retries) {
-        await sleep(300);
-      }
+async function fetchJson(url) {
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      "User-Agent": "Mozilla/5.0 CatalogBackend/1.0",
+      "Accept": "application/json"
     }
-  }
-
-  throw lastError;
-}
-
-function getCache(map, key) {
-  const hit = map.get(key);
-  if (!hit) {
-    return null;
-  }
-
-  if (Date.now() > hit.expiresAt) {
-    map.delete(key);
-    return null;
-  }
-
-  return hit.value;
-}
-
-function setCache(map, key, value, ttlMs) {
-  map.set(key, {
-    value,
-    expiresAt: Date.now() + ttlMs
   });
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`HTTP ${response.status} for ${url}: ${text}`);
+  }
+
+  return response.json();
 }
 
 function toPositiveInt(value, fallback) {
@@ -140,47 +93,39 @@ function toPositiveInt(value, fallback) {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
+function toNonNegativeInt(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+}
+
 function sanitizeString(value, maxLen = 80) {
   return String(value || "").replace(/[\u0000-\u001F\u007F]/g, "").trim().slice(0, maxLen);
 }
 
 function normalizeBool(value) {
-  return value === true || value === "true" || value === "1" || value === 1;
-}
-
-function normalizeSortType(sort) {
-  const value = String(sort || "Relevance").toLowerCase();
-  if (value === "pricelow") return 3;
-  if (value === "pricehigh") return 4;
-  return 0;
-}
-
-function getFallbackKeyword(category) {
-  const c = String(category || "all").toLowerCase();
-
-  if (c === "accessories") return "hat horns accessory";
-  if (c === "clothing") return "shirt pants clothing";
-  if (c === "body") return "face head body";
-  if (c === "animations") return "animation emote";
-  if (c === "bundles") return "bundle";
-  return "avatar";
+  if (value === true || value === "true" || value === "1" || value === 1) {
+    return true;
+  }
+  return false;
 }
 
 function isRobloxCreator(item) {
-  const creatorName = String(
-    item?.creatorName ||
-    item?.creator?.name ||
-    item?.creator?.creatorName ||
-    ""
-  ).trim();
+  const creatorName =
+    String(
+      item?.creatorName ||
+      item?.creator?.name ||
+      item?.creator?.creatorName ||
+      ""
+    ).trim();
 
-  const creatorId = Number(
-    item?.creatorTargetId ??
-    item?.creatorId ??
-    item?.creator?.id ??
-    item?.creator?.creatorTargetId ??
-    0
-  );
+  const creatorId =
+    Number(
+      item?.creatorTargetId ??
+      item?.creatorId ??
+      item?.creator?.id ??
+      item?.creator?.creatorTargetId ??
+      0
+    );
 
   if (creatorId > 0 && Number.isFinite(ROBLOX_CREATOR_ID) && creatorId === ROBLOX_CREATOR_ID) {
     return true;
@@ -190,32 +135,39 @@ function isRobloxCreator(item) {
 }
 
 function detectLimited(item) {
-  if (
+  const collectible =
     item?.collectibleItemId ||
     item?.collectibleProductId ||
-    item?.isLimited === true ||
-    item?.isLimitedUnique === true
-  ) {
+    item?.isLimited ||
+    item?.isLimitedUnique;
+
+  if (collectible) {
     return true;
   }
 
-  const restrictions = Array.isArray(item?.itemRestrictions) ? item.itemRestrictions : [];
-  for (const restriction of restrictions) {
-    if (String(restriction || "").toLowerCase().includes("limited")) {
+  const itemRestrictions = Array.isArray(item?.itemRestrictions) ? item.itemRestrictions : [];
+  for (const restriction of itemRestrictions) {
+    const lowered = String(restriction || "").toLowerCase();
+    if (lowered.includes("limited")) {
       return true;
     }
   }
 
   const priceStatus = String(item?.priceStatus || "").toLowerCase();
-  return priceStatus.includes("limited");
+  if (priceStatus.includes("limited")) {
+    return true;
+  }
+
+  return false;
 }
 
 function normalizeItemType(item) {
-  const rawType = String(
-    item?.itemType ||
-    item?.itemTypeDisplayName ||
-    (item?.bundleType ? "Bundle" : "Asset")
-  ).trim();
+  const rawType =
+    String(
+      item?.itemType ||
+      item?.itemTypeDisplayName ||
+      (item?.bundleType ? "Bundle" : "Asset")
+    ).trim();
 
   return rawType || "Asset";
 }
@@ -245,7 +197,13 @@ function normalizeThumbnail(item) {
 }
 
 function normalizePrice(item) {
-  const n = Number(item?.price ?? item?.lowestPrice ?? 0);
+  const price =
+    item?.price ??
+    item?.lowestPrice ??
+    item?.unitsAvailableForConsumption ??
+    0;
+
+  const n = Number(price);
   return Number.isFinite(n) ? n : 0;
 }
 
@@ -277,8 +235,9 @@ function normalizeBundleType(item) {
 
 function buildTags(item) {
   const tags = [];
+  const limited = detectLimited(item);
 
-  if (detectLimited(item)) {
+  if (limited) {
     tags.push("LIMITED");
   }
 
@@ -296,6 +255,7 @@ function normalizeCatalogItem(item) {
   const itemType = normalizeItemType(item);
   const price = normalizePrice(item);
   const priceStatus = String(item?.priceStatus || "").trim();
+  const creatorName = normalizeCreatorName(item);
   const isForSale =
     item?.isForSale === true ||
     priceStatus === "" ||
@@ -307,7 +267,7 @@ function normalizeCatalogItem(item) {
     ItemType: itemType,
     Name: String(item?.name || item?.itemName || "Item").trim() || "Item",
     Description: normalizeDescription(item),
-    CreatorName: normalizeCreatorName(item),
+    CreatorName: creatorName,
     CreatorTargetId: Number(
       item?.creatorTargetId ??
       item?.creatorId ??
@@ -327,224 +287,21 @@ function normalizeCatalogItem(item) {
   };
 }
 
-function dedupeById(items) {
-  const out = [];
-  const seen = new Set();
-
-  for (const item of items) {
-    const id = Number(item?.Id || 0);
-    if (!Number.isFinite(id) || id <= 0 || seen.has(id)) {
-      continue;
-    }
-
-    seen.add(id);
-    out.push(item);
+function getAllDonations(gameId) {
+  if (Number.isFinite(gameId)) {
+    return db.prepare(`
+      SELECT *
+      FROM donations
+      WHERE gameId = ?
+      ORDER BY timestamp DESC
+    `).all(gameId);
   }
 
-  return out;
-}
-
-function categoryMatches(item, category) {
-  const c = String(category || "all").toLowerCase();
-  if (c === "all") {
-    return true;
-  }
-
-  const assetType = String(item.AssetType || "").toLowerCase();
-  const itemType = String(item.ItemType || "").toLowerCase();
-  const bundleType = String(item.BundleType || "").toLowerCase();
-  const haystack = `${String(item.Name || "").toLowerCase()} ${String(item.Description || "").toLowerCase()}`;
-
-  if (c === "accessories") {
-    if (!assetType) {
-      return itemType !== "bundle";
-    }
-
-    return [
-      "hat",
-      "hairaccessory",
-      "faceaccessory",
-      "neckaccessory",
-      "shoulderaccessory",
-      "frontaccessory",
-      "backaccessory",
-      "waistaccessory"
-    ].includes(assetType);
-  }
-
-  if (c === "clothing") {
-    if (!assetType) {
-      return haystack.includes("shirt") || haystack.includes("pants") || haystack.includes("clothing");
-    }
-
-    return [
-      "shirt",
-      "pants",
-      "tshirt",
-      "classicshirt",
-      "classicpants",
-      "classictshirt"
-    ].includes(assetType);
-  }
-
-  if (c === "body") {
-    if (!assetType) {
-      return haystack.includes("face") || haystack.includes("head") || haystack.includes("body");
-    }
-
-    return [
-      "face",
-      "head",
-      "torso",
-      "leftarm",
-      "rightarm",
-      "leftleg",
-      "rightleg"
-    ].includes(assetType);
-  }
-
-  if (c === "animations") {
-    if (!assetType) {
-      return haystack.includes("animation") || haystack.includes("emote") || haystack.includes("dance");
-    }
-
-    return [
-      "runanimation",
-      "walkanimation",
-      "jumpanimation",
-      "fallanimation",
-      "climbanimation",
-      "idleanimation",
-      "swimanimation",
-      "poseanimation",
-      "emoteanimation"
-    ].includes(assetType);
-  }
-
-  if (c === "bundles") {
-    if (itemType !== "bundle") {
-      return false;
-    }
-
-    if (!bundleType) {
-      return true;
-    }
-
-    return ["bodyparts", "animations", "characters"].includes(bundleType);
-  }
-
-  return true;
-}
-
-async function searchCatalogPage({ keyword, sort, limit, cursor, includeOffSale }) {
-  const url = new URL(`${CATALOG_BASE_URL}/v1/search/items/details`);
-  url.searchParams.set("Keyword", keyword);
-  url.searchParams.set("Limit", String(limit));
-  url.searchParams.set("SortType", String(normalizeSortType(sort)));
-  url.searchParams.set("IncludeNotForSale", includeOffSale ? "true" : "false");
-  url.searchParams.set("SalesTypeFilter", "1");
-
-  if (cursor) {
-    url.searchParams.set("Cursor", cursor);
-  }
-
-  return fetchJson(url.toString(), { timeoutMs: 9000, retries: 1 });
-}
-
-async function searchCatalog({ search, category, sort, page, pageSize, robloxOnly }) {
-  const requestedPage = toPositiveInt(page, 1);
-  const safePageSize = Math.max(1, Math.min(60, toPositiveInt(pageSize, 30)));
-  const keyword = sanitizeString(search || "", 80) || getFallbackKeyword(category);
-  const cacheKey = JSON.stringify({
-    keyword,
-    category: String(category || "All"),
-    sort: String(sort || "Relevance"),
-    page: requestedPage,
-    pageSize: safePageSize,
-    robloxOnly: !!robloxOnly
-  });
-
-  const cached = getCache(catalogCache, cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  const wantedCount = requestedPage * safePageSize;
-  const collected = [];
-  let cursor = "";
-  let reachedEnd = false;
-  let pages = 0;
-  const maxPages = robloxOnly ? 20 : 10;
-
-  while (collected.length < wantedCount && pages < maxPages) {
-    pages += 1;
-
-    const data = await searchCatalogPage({
-      keyword,
-      sort,
-      limit: 30,
-      cursor,
-      includeOffSale: false
-    });
-
-    const rows = Array.isArray(data.data) ? data.data : [];
-    let normalized = rows.map(normalizeCatalogItem);
-
-    if (robloxOnly) {
-      normalized = normalized.filter(item => item.IsRobloxCreated);
-    }
-
-    normalized = normalized.filter(item => categoryMatches(item, category));
-    collected.push(...normalized);
-
-    cursor = data.nextPageCursor || data.nextPageToken || "";
-
-    if (!cursor || rows.length === 0) {
-      reachedEnd = true;
-      break;
-    }
-  }
-
-  const deduped = dedupeById(collected);
-  const startIndex = (requestedPage - 1) * safePageSize;
-  const items = deduped.slice(startIndex, startIndex + safePageSize);
-
-  const result = {
-    success: true,
-    page: requestedPage,
-    pageSize: safePageSize,
-    isFinished: reachedEnd && deduped.length <= startIndex + safePageSize,
-    items
-  };
-
-  setCache(catalogCache, cacheKey, result, CATALOG_CACHE_TTL_MS);
-  return result;
-}
-
-async function getCatalogItemDetails(itemId) {
-  const id = toPositiveInt(itemId, 0);
-  if (!id) {
-    throw new Error("Invalid item id");
-  }
-
-  const cached = getCache(itemCache, String(id));
-  if (cached) {
-    return cached;
-  }
-
-  const url = new URL(`${CATALOG_BASE_URL}/v1/catalog/items/details`);
-  url.searchParams.set("itemIds", String(id));
-
-  const data = await fetchJson(url.toString(), { timeoutMs: 9000, retries: 1 });
-  const rows = Array.isArray(data.data) ? data.data : [];
-
-  if (rows.length === 0) {
-    return null;
-  }
-
-  const item = normalizeCatalogItem(rows[0]);
-  setCache(itemCache, String(id), item, ITEM_CACHE_TTL_MS);
-  return item;
+  return db.prepare(`
+    SELECT *
+    FROM donations
+    ORDER BY timestamp DESC
+  `).all();
 }
 
 function startOfTodayUTC() {
@@ -603,23 +360,6 @@ function buildDonationLeaderboard(donations, type) {
   return Array.from(map.values()).sort((a, b) => b.amount - a.amount);
 }
 
-function getAllDonations(gameId) {
-  if (Number.isFinite(gameId)) {
-    return db.prepare(`
-      SELECT *
-      FROM donations
-      WHERE gameId = ?
-      ORDER BY timestamp DESC
-    `).all(gameId);
-  }
-
-  return db.prepare(`
-    SELECT *
-    FROM donations
-    ORDER BY timestamp DESC
-  `).all();
-}
-
 async function getUserGames(userId) {
   let cursor = "";
   const allGames = [];
@@ -630,7 +370,7 @@ async function getUserGames(userId) {
       `?accessFilter=2&limit=50&sortOrder=Asc` +
       (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
 
-    const data = await fetchJson(url, { timeoutMs: 9000, retries: 1 });
+    const data = await fetchJson(url);
     const items = Array.isArray(data.data) ? data.data : [];
     allGames.push(...items);
 
@@ -654,7 +394,7 @@ async function getUniversePasses(universeId) {
       `?limit=100&sortOrder=Asc` +
       (cursor ? `&pageToken=${encodeURIComponent(cursor)}` : "");
 
-    const data = await fetchJson(url, { timeoutMs: 9000, retries: 1 });
+    const data = await fetchJson(url);
 
     const items =
       Array.isArray(data.gamePasses) ? data.gamePasses :
@@ -674,6 +414,287 @@ async function getUniversePasses(universeId) {
   return allPasses;
 }
 
+function buildCategoryParams(category) {
+  const c = String(category || "all").toLowerCase();
+
+  // These are broad website-catalog hints. They do not need to be perfect because
+  // we normalize/filter again afterward.
+  switch (c) {
+    case "accessories":
+      return {
+        category: "Accessories",
+        fallbackKeywords: "hat accessory"
+      };
+    case "clothing":
+      return {
+        category: "Clothing",
+        fallbackKeywords: "shirt clothing"
+      };
+    case "body":
+      return {
+        category: "BodyParts",
+        fallbackKeywords: "face head body"
+      };
+    case "animations":
+      return {
+        category: "Animations",
+        fallbackKeywords: "animation emote"
+      };
+    case "bundles":
+      return {
+        category: "Characters",
+        fallbackKeywords: "bundle"
+      };
+    case "all":
+    default:
+      return {
+        category: "",
+        fallbackKeywords: "avatar"
+      };
+  }
+}
+
+function buildSortType(sort) {
+  const value = String(sort || "relevance").toLowerCase();
+  if (value === "pricelow") return 3;
+  if (value === "pricehigh") return 4;
+  return 0;
+}
+
+function appendIf(params, key, value) {
+  if (value !== undefined && value !== null && value !== "") {
+    params.set(key, String(value));
+  }
+}
+
+async function searchCatalogPage({
+  keyword,
+  category,
+  sort,
+  limit,
+  cursor,
+  creatorName,
+  creatorTargetId,
+  includeOffSale
+}) {
+  const url = new URL(`${CATALOG_BASE_URL}/v1/search/items/details`);
+  url.searchParams.set("Keyword", keyword);
+  url.searchParams.set("Limit", String(limit));
+  url.searchParams.set("SortType", String(buildSortType(sort)));
+  url.searchParams.set("IncludeNotForSale", includeOffSale ? "true" : "false");
+  url.searchParams.set("SalesTypeFilter", "1");
+
+  const { category: catalogCategory } = buildCategoryParams(category);
+  appendIf(url.searchParams, "Category", catalogCategory);
+  appendIf(url.searchParams, "Cursor", cursor);
+  appendIf(url.searchParams, "CreatorName", creatorName);
+  appendIf(url.searchParams, "CreatorTargetId", creatorTargetId);
+
+  return fetchJson(url.toString());
+}
+
+function dedupeById(items) {
+  const out = [];
+  const seen = new Set();
+
+  for (const item of items) {
+    const id = Number(item?.Id || item?.id || 0);
+    if (!Number.isFinite(id) || id <= 0 || seen.has(id)) {
+      continue;
+    }
+
+    seen.add(id);
+    out.push(item);
+  }
+
+  return out;
+}
+
+function categoryMatches(item, category) {
+  const c = String(category || "all").toLowerCase();
+  if (c === "all") {
+    return true;
+  }
+
+  const assetType = String(item.AssetType || "").toLowerCase();
+  const itemType = String(item.ItemType || "").toLowerCase();
+  const bundleType = String(item.BundleType || "").toLowerCase();
+
+  if (c === "accessories") {
+    return [
+      "hat",
+      "hairaccessory",
+      "faceaccessory",
+      "neckaccessory",
+      "shoulderaccessory",
+      "frontaccessory",
+      "backaccessory",
+      "waistaccessory"
+    ].includes(assetType);
+  }
+
+  if (c === "clothing") {
+    return ["shirt", "pants", "tshirt", "classicshirt", "classicpants", "classictshirt"].includes(assetType);
+  }
+
+  if (c === "body") {
+    return ["face", "head", "torso", "leftarm", "rightarm", "leftleg", "rightleg"].includes(assetType);
+  }
+
+  if (c === "animations") {
+    return [
+      "runanimation",
+      "walkanimation",
+      "jumpanimation",
+      "fallanimation",
+      "climbanimation",
+      "idleanimation",
+      "swimanimation",
+      "poseanimation",
+      "emoteanimation"
+    ].includes(assetType);
+  }
+
+  if (c === "bundles") {
+    if (itemType !== "bundle") {
+      return false;
+    }
+
+    if (!bundleType) {
+      return true;
+    }
+
+    return ["bodyparts", "animations"].includes(bundleType);
+  }
+
+  return true;
+}
+
+async function searchCatalogWithFallback({
+  search,
+  category,
+  sort,
+  page,
+  pageSize,
+  robloxOnly
+}) {
+  const requestedPage = toPositiveInt(page, 1);
+  const safePageSize = Math.max(1, Math.min(60, toPositiveInt(pageSize, 30)));
+  const { fallbackKeywords } = buildCategoryParams(category);
+  const keyword = sanitizeString(search || "", 80) || fallbackKeywords;
+  const includeOffSale = false;
+
+  const desiredCount = requestedPage * safePageSize;
+  const broadResults = [];
+  let finalCursor = "";
+  let reachedEnd = false;
+
+  // Try proper creator-filter request first when Roblox-only is enabled.
+  if (robloxOnly) {
+    try {
+      let creatorCursor = "";
+      let creatorPages = 0;
+
+      while (broadResults.length < desiredCount && creatorPages < 15) {
+        creatorPages += 1;
+
+        const data = await searchCatalogPage({
+          keyword,
+          category,
+          sort,
+          limit: 30,
+          cursor: creatorCursor,
+          creatorName: ROBLOX_CREATOR_NAME,
+          creatorTargetId: ROBLOX_CREATOR_ID,
+          includeOffSale
+        });
+
+        const rows = Array.isArray(data.data) ? data.data : [];
+        const normalized = rows.map(normalizeCatalogItem).filter(item => categoryMatches(item, category));
+
+        broadResults.push(...normalized);
+
+        creatorCursor = data.nextPageCursor || data.nextPageToken || "";
+        if (!creatorCursor || rows.length === 0) {
+          reachedEnd = true;
+          break;
+        }
+      }
+    } catch (err) {
+      console.warn("Creator-filtered catalog search failed, falling back to manual filtering:", err.message);
+    }
+  }
+
+  // Fallback: broad search + manual Roblox filter.
+  if (broadResults.length < desiredCount) {
+    let cursor = "";
+    let pages = 0;
+
+    while (broadResults.length < desiredCount && pages < 60) {
+      pages += 1;
+
+      const data = await searchCatalogPage({
+        keyword,
+        category,
+        sort,
+        limit: 30,
+        cursor,
+        includeOffSale
+      });
+
+      const rows = Array.isArray(data.data) ? data.data : [];
+      let normalized = rows.map(normalizeCatalogItem);
+
+      if (robloxOnly) {
+        normalized = normalized.filter(item => item.IsRobloxCreated);
+      }
+
+      normalized = normalized.filter(item => categoryMatches(item, category));
+      broadResults.push(...normalized);
+
+      cursor = data.nextPageCursor || data.nextPageToken || "";
+      finalCursor = cursor;
+
+      if (!cursor || rows.length === 0) {
+        reachedEnd = true;
+        break;
+      }
+    }
+  }
+
+  const deduped = dedupeById(broadResults);
+  const startIndex = (requestedPage - 1) * safePageSize;
+  const items = deduped.slice(startIndex, startIndex + safePageSize);
+  const isFinished = reachedEnd && deduped.length <= startIndex + safePageSize;
+
+  return {
+    success: true,
+    page: requestedPage,
+    pageSize: safePageSize,
+    isFinished,
+    nextCursor: finalCursor || "",
+    items
+  };
+}
+
+async function getCatalogItemDetails(itemId) {
+  const id = toPositiveInt(itemId, 0);
+  if (!id) {
+    throw new Error("Invalid item id");
+  }
+
+  const url = new URL(`${CATALOG_BASE_URL}/v1/catalog/items/details`);
+  url.searchParams.set("itemIds", String(id));
+
+  const data = await fetchJson(url.toString());
+  const rows = Array.isArray(data.data) ? data.data : [];
+  if (rows.length === 0) {
+    return null;
+  }
+
+  return normalizeCatalogItem(rows[0]);
+}
+
 app.get("/", (req, res) => {
   return res.json({
     success: true,
@@ -683,7 +704,7 @@ app.get("/", (req, res) => {
 
 app.get("/catalog/search", async (req, res) => {
   try {
-    const result = await searchCatalog({
+    const result = await searchCatalogWithFallback({
       search: req.query.search,
       category: req.query.category,
       sort: req.query.sort,
@@ -694,7 +715,7 @@ app.get("/catalog/search", async (req, res) => {
 
     return res.json(result);
   } catch (error) {
-    console.error("GET /catalog/search error:", error.stack || error.message);
+    console.error("GET /catalog/search error:", error.message);
 
     return res.status(500).json({
       success: false,
@@ -719,7 +740,7 @@ app.get("/catalog/item/:id", async (req, res) => {
       item
     });
   } catch (error) {
-    console.error("GET /catalog/item/:id error:", error.stack || error.message);
+    console.error("GET /catalog/item/:id error:", error.message);
 
     return res.status(500).json({
       success: false,
