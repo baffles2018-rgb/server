@@ -12,13 +12,19 @@ const DB_PATH = path.resolve(process.env.DB_PATH || "./donations.db");
 const CATALOG_BASE_URL = String(process.env.CATALOG_BASE_URL || "https://catalog.roproxy.com").replace(/\/+$/, "");
 const GAMES_BASE_URL = String(process.env.GAMES_BASE_URL || "https://games.roproxy.com").replace(/\/+$/, "");
 const PASSES_BASE_URL = String(process.env.PASSES_BASE_URL || "https://apis.roproxy.com").replace(/\/+$/, "");
+const GROUPS_BASE_URL = String(process.env.GROUPS_BASE_URL || "https://groups.roproxy.com").replace(/\/+$/, "");
+const THUMBNAILS_BASE_URL = String(process.env.THUMBNAILS_BASE_URL || "https://thumbnails.roproxy.com").replace(/\/+$/, "");
+
 const ROBLOX_CREATOR_NAME = String(process.env.ROBLOX_CREATOR_NAME || "Roblox").trim();
 const ROBLOX_CREATOR_ID = Number(process.env.ROBLOX_CREATOR_ID || 1);
 
 const CATALOG_CACHE_TTL_MS = 60 * 1000;
 const ITEM_CACHE_TTL_MS = 5 * 60 * 1000;
+const GROUP_CACHE_TTL_MS = 5 * 60 * 1000;
+
 const catalogCache = new Map();
 const itemCache = new Map();
+const groupCache = new Map();
 
 if (!global.fetch) {
   console.error("This backend requires Node 18+ because it uses the built-in fetch API.");
@@ -547,6 +553,91 @@ async function getCatalogItemDetails(itemId) {
   return item;
 }
 
+async function getUserGroups(userId) {
+  const url = `${GROUPS_BASE_URL}/v2/users/${encodeURIComponent(userId)}/groups/roles`;
+  const data = await fetchJson(url, { timeoutMs: 9000, retries: 1 });
+  return Array.isArray(data.data) ? data.data : [];
+}
+
+async function getGroupThumbnails(groupIds) {
+  const ids = Array.isArray(groupIds)
+    ? groupIds.map(id => Number(id)).filter(id => Number.isFinite(id) && id > 0)
+    : [];
+
+  if (ids.length === 0) {
+    return new Map();
+  }
+
+  const url = new URL(`${THUMBNAILS_BASE_URL}/v1/groups/icons`);
+  url.searchParams.set("groupIds", ids.join(","));
+  url.searchParams.set("size", "150x150");
+  url.searchParams.set("format", "Png");
+  url.searchParams.set("isCircular", "false");
+
+  const data = await fetchJson(url.toString(), { timeoutMs: 9000, retries: 1 });
+  const rows = Array.isArray(data.data) ? data.data : [];
+  const out = new Map();
+
+  for (const row of rows) {
+    const id = Number(row.targetId || row.groupId || 0);
+    if (!Number.isFinite(id) || id <= 0) {
+      continue;
+    }
+
+    out.set(id, String(row.imageUrl || "").trim());
+  }
+
+  return out;
+}
+
+function normalizePlayerGroupEntry(entry, thumbMap) {
+  const group = entry?.group || {};
+  const role = entry?.role || {};
+  const groupId = Number(group.id || 0);
+
+  return {
+    id: groupId,
+    name: String(group.name || "Group").trim() || "Group",
+    description: String(group.description || "").trim(),
+    memberCount: Number(group.memberCount || 0) || 0,
+    roleName: String(role.name || "").trim(),
+    roleRank: Number(role.rank || 0) || 0,
+    thumbnail: thumbMap.get(groupId) || ""
+  };
+}
+
+async function getPrimaryGroup(userId) {
+  const cacheKey = `primary_group_${userId}`;
+  const cached = getCache(groupCache, cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const rawGroups = await getUserGroups(userId);
+  const groupIds = rawGroups
+    .map(entry => Number(entry?.group?.id || 0))
+    .filter(id => Number.isFinite(id) && id > 0);
+
+  const thumbMap = await getGroupThumbnails(groupIds);
+  const normalized = rawGroups.map(entry => normalizePlayerGroupEntry(entry, thumbMap));
+
+  normalized.sort((a, b) => {
+    if (b.roleRank !== a.roleRank) {
+      return b.roleRank - a.roleRank;
+    }
+
+    if (b.memberCount !== a.memberCount) {
+      return b.memberCount - a.memberCount;
+    }
+
+    return a.name.localeCompare(b.name);
+  });
+
+  const result = normalized[0] || null;
+  setCache(groupCache, cacheKey, result, GROUP_CACHE_TTL_MS);
+  return result;
+}
+
 function startOfTodayUTC() {
   const now = new Date();
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
@@ -724,6 +815,66 @@ app.get("/catalog/item/:id", async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to fetch catalog item"
+    });
+  }
+});
+
+app.get("/player/groups", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "").trim();
+
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing userId"
+      });
+    }
+
+    const rawGroups = await getUserGroups(userId);
+    const groupIds = rawGroups
+      .map(entry => Number(entry?.group?.id || 0))
+      .filter(id => Number.isFinite(id) && id > 0);
+
+    const thumbMap = await getGroupThumbnails(groupIds);
+    const groups = rawGroups.map(entry => normalizePlayerGroupEntry(entry, thumbMap));
+
+    return res.json({
+      success: true,
+      groups
+    });
+  } catch (error) {
+    console.error("GET /player/groups error:", error.stack || error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch player groups"
+    });
+  }
+});
+
+app.get("/player/primary-group", async (req, res) => {
+  try {
+    const userId = String(req.query.userId || "").trim();
+
+    if (!userId) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing userId"
+      });
+    }
+
+    const group = await getPrimaryGroup(userId);
+
+    return res.json({
+      success: true,
+      group
+    });
+  } catch (error) {
+    console.error("GET /player/primary-group error:", error.stack || error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch primary group"
     });
   }
 });
@@ -992,4 +1143,6 @@ app.listen(PORT, () => {
   console.log(`Listening on port ${PORT}`);
   console.log(`Using SQLite database at: ${DB_PATH}`);
   console.log(`Catalog base URL: ${CATALOG_BASE_URL}`);
+  console.log(`Groups base URL: ${GROUPS_BASE_URL}`);
+  console.log(`Thumbnails base URL: ${THUMBNAILS_BASE_URL}`);
 });
