@@ -710,6 +710,8 @@ app.get("/", (req, res) => {
 });
 
 app.get("/catalog/search", async (req, res) => {
+  const started = Date.now();
+
   try {
     const result = await searchCatalogWithFallback({
       search: req.query.search,
@@ -720,9 +722,23 @@ app.get("/catalog/search", async (req, res) => {
       robloxOnly: normalizeBool(req.query.robloxOnly)
     });
 
+    console.log(
+      "GET /catalog/search ok",
+      JSON.stringify({
+        ms: Date.now() - started,
+        search: req.query.search || "",
+        category: req.query.category || "",
+        sort: req.query.sort || "",
+        page: req.query.page || 1,
+        pageSize: req.query.pageSize || req.query.limit || 30,
+        robloxOnly: normalizeBool(req.query.robloxOnly),
+        count: Array.isArray(result.items) ? result.items.length : 0
+      })
+    );
+
     return res.json(result);
   } catch (error) {
-    console.error("GET /catalog/search error:", error.message);
+    console.error("GET /catalog/search error:", error.message, "after", Date.now() - started, "ms");
 
     return res.status(500).json({
       success: false,
