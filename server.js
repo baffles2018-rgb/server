@@ -15,6 +15,11 @@ const PASSES_BASE_URL = String(process.env.PASSES_BASE_URL || "https://apis.ropr
 const ROBLOX_CREATOR_NAME = String(process.env.ROBLOX_CREATOR_NAME || "Roblox").trim();
 const ROBLOX_CREATOR_ID = Number(process.env.ROBLOX_CREATOR_ID || 1);
 
+const CATALOG_CACHE_TTL_MS = 60 * 1000;
+const ITEM_CACHE_TTL_MS = 5 * 60 * 1000;
+const catalogCache = new Map();
+const itemCache = new Map();
+
 if (!global.fetch) {
   console.error("This backend requires Node 18+ because it uses the built-in fetch API.");
   process.exit(1);
@@ -62,21 +67,72 @@ function requireApiKey(req, res, next) {
   next();
 }
 
-async function fetchJson(url) {
-  const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      "User-Agent": "Mozilla/5.0 CatalogBackend/1.0",
-      "Accept": "application/json"
-    }
-  });
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`HTTP ${response.status} for ${url}: ${text}`);
+async function fetchJson(url, options = {}) {
+  const {
+    timeoutMs = 10000,
+    retries = 1
+  } = options;
+
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const response = await fetch(url, {
+        method: "GET",
+        headers: {
+          "User-Agent": "Mozilla/5.0 CatalogBackend/2.0",
+          "Accept": "application/json"
+        },
+        signal: controller.signal
+      });
+
+      clearTimeout(timer);
+
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        throw new Error(`HTTP ${response.status} for ${url}: ${text}`);
+      }
+
+      return await response.json();
+    } catch (error) {
+      clearTimeout(timer);
+      lastError = error;
+
+      if (attempt < retries) {
+        await sleep(300);
+      }
+    }
   }
 
-  return response.json();
+  throw lastError;
+}
+
+function getCache(map, key) {
+  const hit = map.get(key);
+  if (!hit) {
+    return null;
+  }
+
+  if (Date.now() > hit.expiresAt) {
+    map.delete(key);
+    return null;
+  }
+
+  return hit.value;
+}
+
+function setCache(map, key, value, ttlMs) {
+  map.set(key, {
+    value,
+    expiresAt: Date.now() + ttlMs
+  });
 }
 
 function toPositiveInt(value, fallback) {
@@ -100,33 +156,31 @@ function normalizeSortType(sort) {
 }
 
 function getFallbackKeyword(category) {
-  const c = String(category || "All").toLowerCase();
+  const c = String(category || "all").toLowerCase();
 
-  if (c === "accessories") return "hat accessory";
-  if (c === "clothing") return "shirt clothing";
-  if (c === "body") return "body head face";
+  if (c === "accessories") return "hat horns accessory";
+  if (c === "clothing") return "shirt pants clothing";
+  if (c === "body") return "face head body";
   if (c === "animations") return "animation emote";
   if (c === "bundles") return "bundle";
   return "avatar";
 }
 
 function isRobloxCreator(item) {
-  const creatorName =
-    String(
-      item?.creatorName ||
-      item?.creator?.name ||
-      item?.creator?.creatorName ||
-      ""
-    ).trim();
+  const creatorName = String(
+    item?.creatorName ||
+    item?.creator?.name ||
+    item?.creator?.creatorName ||
+    ""
+  ).trim();
 
-  const creatorId =
-    Number(
-      item?.creatorTargetId ??
-      item?.creatorId ??
-      item?.creator?.id ??
-      item?.creator?.creatorTargetId ??
-      0
-    );
+  const creatorId = Number(
+    item?.creatorTargetId ??
+    item?.creatorId ??
+    item?.creator?.id ??
+    item?.creator?.creatorTargetId ??
+    0
+  );
 
   if (creatorId > 0 && Number.isFinite(ROBLOX_CREATOR_ID) && creatorId === ROBLOX_CREATOR_ID) {
     return true;
@@ -157,12 +211,11 @@ function detectLimited(item) {
 }
 
 function normalizeItemType(item) {
-  const rawType =
-    String(
-      item?.itemType ||
-      item?.itemTypeDisplayName ||
-      (item?.bundleType ? "Bundle" : "Asset")
-    ).trim();
+  const rawType = String(
+    item?.itemType ||
+    item?.itemTypeDisplayName ||
+    (item?.bundleType ? "Bundle" : "Asset")
+  ).trim();
 
   return rawType || "Asset";
 }
@@ -300,8 +353,13 @@ function categoryMatches(item, category) {
   const assetType = String(item.AssetType || "").toLowerCase();
   const itemType = String(item.ItemType || "").toLowerCase();
   const bundleType = String(item.BundleType || "").toLowerCase();
+  const haystack = `${String(item.Name || "").toLowerCase()} ${String(item.Description || "").toLowerCase()}`;
 
   if (c === "accessories") {
+    if (!assetType) {
+      return itemType !== "bundle";
+    }
+
     return [
       "hat",
       "hairaccessory",
@@ -315,6 +373,10 @@ function categoryMatches(item, category) {
   }
 
   if (c === "clothing") {
+    if (!assetType) {
+      return haystack.includes("shirt") || haystack.includes("pants") || haystack.includes("clothing");
+    }
+
     return [
       "shirt",
       "pants",
@@ -326,6 +388,10 @@ function categoryMatches(item, category) {
   }
 
   if (c === "body") {
+    if (!assetType) {
+      return haystack.includes("face") || haystack.includes("head") || haystack.includes("body");
+    }
+
     return [
       "face",
       "head",
@@ -338,6 +404,10 @@ function categoryMatches(item, category) {
   }
 
   if (c === "animations") {
+    if (!assetType) {
+      return haystack.includes("animation") || haystack.includes("emote") || haystack.includes("dance");
+    }
+
     return [
       "runanimation",
       "walkanimation",
@@ -360,19 +430,13 @@ function categoryMatches(item, category) {
       return true;
     }
 
-    return ["bodyparts", "animations"].includes(bundleType);
+    return ["bodyparts", "animations", "characters"].includes(bundleType);
   }
 
   return true;
 }
 
-async function searchCatalogPage({
-  keyword,
-  sort,
-  limit,
-  cursor,
-  includeOffSale
-}) {
+async function searchCatalogPage({ keyword, sort, limit, cursor, includeOffSale }) {
   const url = new URL(`${CATALOG_BASE_URL}/v1/search/items/details`);
   url.searchParams.set("Keyword", keyword);
   url.searchParams.set("Limit", String(limit));
@@ -384,28 +448,33 @@ async function searchCatalogPage({
     url.searchParams.set("Cursor", cursor);
   }
 
-  return fetchJson(url.toString());
+  return fetchJson(url.toString(), { timeoutMs: 9000, retries: 1 });
 }
 
-async function searchCatalog({
-  search,
-  category,
-  sort,
-  page,
-  pageSize,
-  robloxOnly
-}) {
+async function searchCatalog({ search, category, sort, page, pageSize, robloxOnly }) {
   const requestedPage = toPositiveInt(page, 1);
   const safePageSize = Math.max(1, Math.min(60, toPositiveInt(pageSize, 30)));
   const keyword = sanitizeString(search || "", 80) || getFallbackKeyword(category);
-  const includeOffSale = false;
+  const cacheKey = JSON.stringify({
+    keyword,
+    category: String(category || "All"),
+    sort: String(sort || "Relevance"),
+    page: requestedPage,
+    pageSize: safePageSize,
+    robloxOnly: !!robloxOnly
+  });
+
+  const cached = getCache(catalogCache, cacheKey);
+  if (cached) {
+    return cached;
+  }
 
   const wantedCount = requestedPage * safePageSize;
   const collected = [];
   let cursor = "";
   let reachedEnd = false;
   let pages = 0;
-  const maxPages = robloxOnly ? 80 : 25;
+  const maxPages = robloxOnly ? 20 : 10;
 
   while (collected.length < wantedCount && pages < maxPages) {
     pages += 1;
@@ -415,7 +484,7 @@ async function searchCatalog({
       sort,
       limit: 30,
       cursor,
-      includeOffSale
+      includeOffSale: false
     });
 
     const rows = Array.isArray(data.data) ? data.data : [];
@@ -439,15 +508,17 @@ async function searchCatalog({
   const deduped = dedupeById(collected);
   const startIndex = (requestedPage - 1) * safePageSize;
   const items = deduped.slice(startIndex, startIndex + safePageSize);
-  const isFinished = reachedEnd && deduped.length <= startIndex + safePageSize;
 
-  return {
+  const result = {
     success: true,
     page: requestedPage,
     pageSize: safePageSize,
-    isFinished,
+    isFinished: reachedEnd && deduped.length <= startIndex + safePageSize,
     items
   };
+
+  setCache(catalogCache, cacheKey, result, CATALOG_CACHE_TTL_MS);
+  return result;
 }
 
 async function getCatalogItemDetails(itemId) {
@@ -456,17 +527,24 @@ async function getCatalogItemDetails(itemId) {
     throw new Error("Invalid item id");
   }
 
+  const cached = getCache(itemCache, String(id));
+  if (cached) {
+    return cached;
+  }
+
   const url = new URL(`${CATALOG_BASE_URL}/v1/catalog/items/details`);
   url.searchParams.set("itemIds", String(id));
 
-  const data = await fetchJson(url.toString());
+  const data = await fetchJson(url.toString(), { timeoutMs: 9000, retries: 1 });
   const rows = Array.isArray(data.data) ? data.data : [];
 
   if (rows.length === 0) {
     return null;
   }
 
-  return normalizeCatalogItem(rows[0]);
+  const item = normalizeCatalogItem(rows[0]);
+  setCache(itemCache, String(id), item, ITEM_CACHE_TTL_MS);
+  return item;
 }
 
 function startOfTodayUTC() {
@@ -552,7 +630,7 @@ async function getUserGames(userId) {
       `?accessFilter=2&limit=50&sortOrder=Asc` +
       (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
 
-    const data = await fetchJson(url);
+    const data = await fetchJson(url, { timeoutMs: 9000, retries: 1 });
     const items = Array.isArray(data.data) ? data.data : [];
     allGames.push(...items);
 
@@ -576,7 +654,7 @@ async function getUniversePasses(universeId) {
       `?limit=100&sortOrder=Asc` +
       (cursor ? `&pageToken=${encodeURIComponent(cursor)}` : "");
 
-    const data = await fetchJson(url);
+    const data = await fetchJson(url, { timeoutMs: 9000, retries: 1 });
 
     const items =
       Array.isArray(data.gamePasses) ? data.gamePasses :
