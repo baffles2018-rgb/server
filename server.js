@@ -586,7 +586,7 @@ async function searchCatalogWithFallback({
   robloxOnly
 }) {
   const requestedPage = toPositiveInt(page, 1);
-  const safePageSize = Math.max(1, Math.min(60, toPositiveInt(pageSize, 30)));
+  const safePageSize = Math.max(1, Math.min(60, toPositiveInt(pageSize, 16)));
   const { fallbackKeywords } = buildCategoryParams(category);
   const keyword = sanitizeString(search || "", 80) || fallbackKeywords;
   const includeOffSale = false;
@@ -602,7 +602,7 @@ async function searchCatalogWithFallback({
       let creatorCursor = "";
       let creatorPages = 0;
 
-      while (broadResults.length < desiredCount && creatorPages < 15) {
+      while (broadResults.length < desiredCount && creatorPages < 4) {
         creatorPages += 1;
 
         const data = await searchCatalogPage({
@@ -633,11 +633,11 @@ async function searchCatalogWithFallback({
   }
 
   // Fallback: broad search + manual Roblox filter.
-  if (broadResults.length < desiredCount) {
+  if (!robloxOnly && broadResults.length < desiredCount) {
     let cursor = "";
     let pages = 0;
 
-    while (broadResults.length < desiredCount && pages < 60) {
+    while (broadResults.length < desiredCount && pages < 8) {
       pages += 1;
 
       const data = await searchCatalogPage({
