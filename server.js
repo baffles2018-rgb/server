@@ -12,6 +12,7 @@ const DB_PATH = path.resolve(process.env.DB_PATH || "./donations.db");
 /*
   Node 18+ required for global fetch.
   Optional envs:
+  - API_KEY=your-secret-key-here
   - CATALOG_BASE_URL=https://catalog.roproxy.com
   - GAMES_BASE_URL=https://games.roproxy.com
   - PASSES_BASE_URL=https://apis.roproxy.com
@@ -30,8 +31,7 @@ if (!global.fetch) {
 }
 
 if (!API_KEY) {
-  console.error("Missing API_KEY environment variable.");
-  process.exit(1);
+  console.warn("API_KEY is not set. Public routes will still work, but protected donation POST requests will be disabled.");
 }
 
 const db = new Database(DB_PATH);
@@ -59,6 +59,13 @@ db.exec(`
 `);
 
 function requireApiKey(req, res, next) {
+  if (!API_KEY) {
+    return res.status(503).json({
+      success: false,
+      message: "Donations endpoint is disabled because API_KEY is not configured on the backend."
+    });
+  }
+
   const providedKey = String(req.header("x-api-key") || "").trim();
 
   if (!providedKey || providedKey !== API_KEY) {
