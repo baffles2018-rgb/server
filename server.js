@@ -50,6 +50,7 @@ db.exec(`
     gameId INTEGER NOT NULL DEFAULT 0,
     placeId INTEGER NOT NULL DEFAULT 0,
     purchaseId TEXT,
+    donationMethod TEXT NOT NULL DEFAULT 'Legacy',
     timestamp TEXT NOT NULL
   );
 
@@ -59,6 +60,14 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_donations_toUserId ON donations(toUserId);
   CREATE UNIQUE INDEX IF NOT EXISTS idx_donations_purchaseId ON donations(purchaseId);
 `);
+
+try {
+  db.exec("ALTER TABLE donations ADD COLUMN donationMethod TEXT NOT NULL DEFAULT 'Legacy'");
+} catch (error) {
+  if (!String(error.message || "").toLowerCase().includes("duplicate column")) {
+    console.error("Unable to migrate donationMethod column:", error.message);
+  }
+}
 
 function requireApiKey(req, res, next) {
   const providedKey = String(req.header("x-api-key") || "").trim();
@@ -711,58 +720,46 @@ function getAllDonations(gameId) {
   `).all();
 }
 
-async function getUserGames(userId) {
+async function getUserClassicTShirts(userId) {
+  const found = [];
   let cursor = "";
-  const allGames = [];
 
-  while (true) {
-    const url =
-      `${GAMES_BASE_URL}/v2/users/${encodeURIComponent(userId)}/games` +
-      `?accessFilter=2&limit=50&sortOrder=Asc` +
-      (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
+  for (let page = 0; page < 5; page += 1) {
+    const url = new URL(`${CATALOG_BASE_URL}/v1/search/items/details`);
+    url.searchParams.set("CreatorType", "User");
+    url.searchParams.set("CreatorTargetId", String(userId));
+    url.searchParams.set("Category", "3");
+    url.searchParams.set("Subcategory", "55"); // Classic T-Shirts
+    url.searchParams.set("IncludeNotForSale", "false");
+    url.searchParams.set("SalesTypeFilter", "1");
+    url.searchParams.set("Limit", "30");
+    if (cursor) url.searchParams.set("Cursor", cursor);
 
-    const data = await fetchJson(url, { timeoutMs: 9000, retries: 1 });
-    const items = Array.isArray(data.data) ? data.data : [];
-    allGames.push(...items);
+    const data = await fetchJson(url.toString(), { timeoutMs: 9000, retries: 1 });
+    const rows = Array.isArray(data.data) ? data.data : [];
 
-    if (!data.nextPageCursor) {
-      break;
+    for (const rawItem of rows) {
+      const item = normalizeCatalogItem(rawItem);
+      const typeText = `${item.AssetType} ${rawItem.assetTypeName || ""} ${rawItem.assetType || ""}`.toLowerCase();
+      const isClassicTShirt = typeText.includes("tshirt") || typeText.includes("t-shirt");
+      if (item.Id > 0 && item.Price > 0 && item.CreatorTargetId === Number(userId) && isClassicTShirt) {
+        found.push({
+          AssetId: item.Id,
+          ItemType: "TShirt",
+          Name: item.Name,
+          Price: item.Price,
+          Icon: item.Thumbnail
+        });
+      }
     }
 
-    cursor = data.nextPageCursor;
+    cursor = data.nextPageCursor || data.nextPageToken || "";
+    if (!cursor || rows.length === 0) break;
   }
 
-  return allGames;
-}
-
-async function getUniversePasses(universeId) {
-  let cursor = "";
-  const allPasses = [];
-
-  while (true) {
-    const url =
-      `${PASSES_BASE_URL}/game-passes/v1/universes/${encodeURIComponent(universeId)}/game-passes` +
-      `?limit=100&sortOrder=Asc` +
-      (cursor ? `&pageToken=${encodeURIComponent(cursor)}` : "");
-
-    const data = await fetchJson(url, { timeoutMs: 9000, retries: 1 });
-
-    const items =
-      Array.isArray(data.gamePasses) ? data.gamePasses :
-      Array.isArray(data.data) ? data.data :
-      [];
-
-    allPasses.push(...items);
-
-    const nextToken = data.nextPageToken || data.nextPageCursor || "";
-    if (!nextToken) {
-      break;
-    }
-
-    cursor = nextToken;
-  }
-
-  return allPasses;
+  return dedupeById(found.map(item => ({ ...item, Id: item.AssetId }))).map(item => ({
+    AssetId: item.AssetId, ItemType: item.ItemType, Name: item.Name, Price: item.Price, Icon: item.Icon
+  }));
 }
 
 app.get("/", (req, res) => {
@@ -879,68 +876,19 @@ app.get("/player/primary-group", async (req, res) => {
   }
 });
 
-app.get("/roblox-passes", async (req, res) => {
+app.get("/roblox-tshirts", async (req, res) => {
   try {
     const userId = String(req.query.userId || "").trim();
-
-    if (!userId) {
-      return res.status(400).json({
-        success: false,
-        message: "Missing userId"
-      });
+    if (!userId || !Number.isFinite(Number(userId))) {
+      return res.status(400).json({ success: false, message: "Missing userId" });
     }
 
-    const games = await getUserGames(userId);
-
-    const seenUniverseIds = new Set();
-    const seenPassIds = new Set();
-    const passItems = [];
-
-    for (const game of games) {
-      const universeId = Number(game.id || game.rootPlace?.universeId || game.universeId);
-
-      if (!Number.isFinite(universeId) || seenUniverseIds.has(universeId)) {
-        continue;
-      }
-
-      seenUniverseIds.add(universeId);
-
-      try {
-        const passes = await getUniversePasses(universeId);
-
-        for (const pass of passes) {
-          const passId = Number(
-            pass.id ||
-            pass.gamePassId ||
-            pass.passId ||
-            (typeof pass.path === "string" ? pass.path.split("/").pop() : 0)
-          );
-
-          if (!Number.isFinite(passId) || seenPassIds.has(passId)) {
-            continue;
-          }
-
-          seenPassIds.add(passId);
-          passItems.push({ PassId: passId });
-        }
-      } catch (err) {
-        console.error(`Failed to fetch passes for universe ${universeId}:`, err.message);
-      }
-    }
-
-    passItems.sort((a, b) => a.PassId - b.PassId);
-
-    return res.json({
-      success: true,
-      items: passItems
-    });
+    const items = await getUserClassicTShirts(userId);
+    items.sort((a, b) => a.Price === b.Price ? a.AssetId - b.AssetId : a.Price - b.Price);
+    return res.json({ success: true, items });
   } catch (error) {
-    console.error("roblox-passes error:", error.message);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to fetch passes"
-    });
+    console.error("roblox-tshirts error:", error.message);
+    return res.status(500).json({ success: false, message: "Failed to fetch classic T-shirts" });
   }
 });
 
@@ -954,7 +902,8 @@ app.post("/donations", requireApiKey, (req, res) => {
       amount,
       gameId,
       placeId,
-      purchaseId
+      purchaseId,
+      donationMethod
     } = req.body || {};
 
     const donorId = Number(fromUserId);
@@ -963,6 +912,7 @@ app.post("/donations", requireApiKey, (req, res) => {
     const parsedGameId = Number(gameId || 0);
     const parsedPlaceId = Number(placeId || 0);
     const normalizedPurchaseId = String(purchaseId || "").trim();
+    const normalizedDonationMethod = sanitizeString(donationMethod || "Legacy", 30) || "Legacy";
 
     if (
       !Number.isFinite(donorId) ||
@@ -1008,6 +958,7 @@ app.post("/donations", requireApiKey, (req, res) => {
       gameId: Number.isFinite(parsedGameId) ? parsedGameId : 0,
       placeId: Number.isFinite(parsedPlaceId) ? parsedPlaceId : 0,
       purchaseId: normalizedPurchaseId,
+      donationMethod: normalizedDonationMethod,
       timestamp: new Date().toISOString()
     };
 
@@ -1022,8 +973,9 @@ app.post("/donations", requireApiKey, (req, res) => {
         gameId,
         placeId,
         purchaseId,
+        donationMethod,
         timestamp
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       donation.id,
       donation.fromUserId,
@@ -1034,6 +986,7 @@ app.post("/donations", requireApiKey, (req, res) => {
       donation.gameId,
       donation.placeId,
       donation.purchaseId,
+      donation.donationMethod,
       donation.timestamp
     );
 
