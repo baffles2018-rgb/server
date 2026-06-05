@@ -722,44 +722,112 @@ function getAllDonations(gameId) {
 
 async function getUserClassicTShirts(userId) {
   const found = [];
-  let cursor = "";
+  const seen = new Set();
 
-  for (let page = 0; page < 5; page += 1) {
-    const url = new URL(`${CATALOG_BASE_URL}/v1/search/items/details`);
-    url.searchParams.set("CreatorType", "User");
-    url.searchParams.set("CreatorTargetId", String(userId));
-    url.searchParams.set("Category", "3");
-    url.searchParams.set("Subcategory", "55"); // Classic T-Shirts
-    url.searchParams.set("IncludeNotForSale", "false");
-    url.searchParams.set("SalesTypeFilter", "1");
-    url.searchParams.set("Limit", "30");
-    if (cursor) url.searchParams.set("Cursor", cursor);
+  const searches = [
+    {
+      label: "Classic T-Shirt",
+      category: "3",
+      subcategory: "55",
+      assetTypeId: 2
+    },
+    {
+      label: "Classic Shirt",
+      category: "3",
+      subcategory: "56",
+      assetTypeId: 11
+    },
+    {
+      label: "Classic Pants",
+      category: "3",
+      subcategory: "57",
+      assetTypeId: 12
+    }
+  ];
 
-    const data = await fetchJson(url.toString(), { timeoutMs: 9000, retries: 1 });
-    const rows = Array.isArray(data.data) ? data.data : [];
+  for (const search of searches) {
+    let cursor = "";
 
-    for (const rawItem of rows) {
-      const item = normalizeCatalogItem(rawItem);
-      const typeText = `${item.AssetType} ${rawItem.assetTypeName || ""} ${rawItem.assetType || ""}`.toLowerCase();
-      const isClassicTShirt = typeText.includes("tshirt") || typeText.includes("t-shirt");
-      if (item.Id > 0 && item.Price > 0 && item.CreatorTargetId === Number(userId) && isClassicTShirt) {
+    for (let page = 0; page < 5; page += 1) {
+      const url = new URL(`${CATALOG_BASE_URL}/v1/search/items/details`);
+
+      url.searchParams.set("CreatorType", "User");
+      url.searchParams.set("CreatorTargetId", String(userId));
+      url.searchParams.set("Category", search.category);
+      url.searchParams.set("Subcategory", search.subcategory);
+      url.searchParams.set("IncludeNotForSale", "false");
+      url.searchParams.set("SalesTypeFilter", "1");
+      url.searchParams.set("SortType", "3");
+      url.searchParams.set("Limit", "30");
+
+      if (cursor) {
+        url.searchParams.set("Cursor", cursor);
+      }
+
+      const data = await fetchJson(url.toString(), {
+        timeoutMs: 9000,
+        retries: 1
+      });
+
+      const rows = Array.isArray(data.data) ? data.data : [];
+
+      for (const rawItem of rows) {
+        const assetId = Number(rawItem.id || rawItem.itemId || 0);
+        const price = Number(rawItem.price ?? rawItem.lowestPrice ?? 0);
+
+        const creatorTargetId = Number(
+          rawItem.creatorTargetId ??
+          rawItem.creatorId ??
+          rawItem.creator?.id ??
+          rawItem.creator?.creatorTargetId ??
+          0
+        );
+
+        if (!Number.isFinite(assetId) || assetId <= 0) {
+          continue;
+        }
+
+        if (seen.has(assetId)) {
+          continue;
+        }
+
+        if (!Number.isFinite(price) || price <= 0) {
+          continue;
+        }
+
+        if (creatorTargetId !== Number(userId)) {
+          continue;
+        }
+
+        seen.add(assetId);
+
         found.push({
-          AssetId: item.Id,
+          AssetId: assetId,
           ItemType: "TShirt",
-          Name: item.Name,
-          Price: item.Price,
-          Icon: item.Thumbnail
+          ClothingType: search.label,
+          Name: String(rawItem.name || rawItem.itemName || search.label),
+          Price: Math.floor(price),
+          Icon: `rbxthumb://type=Asset&id=${assetId}&w=420&h=420`
         });
       }
-    }
 
-    cursor = data.nextPageCursor || data.nextPageToken || "";
-    if (!cursor || rows.length === 0) break;
+      cursor = data.nextPageCursor || data.nextPageToken || "";
+
+      if (!cursor || rows.length === 0) {
+        break;
+      }
+    }
   }
 
-  return dedupeById(found.map(item => ({ ...item, Id: item.AssetId }))).map(item => ({
-    AssetId: item.AssetId, ItemType: item.ItemType, Name: item.Name, Price: item.Price, Icon: item.Icon
-  }));
+  found.sort((a, b) => {
+    if (a.Price === b.Price) {
+      return a.AssetId - b.AssetId;
+    }
+
+    return a.Price - b.Price;
+  });
+
+  return found;
 }
 
 app.get("/", (req, res) => {
