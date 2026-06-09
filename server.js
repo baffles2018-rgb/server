@@ -26,6 +26,57 @@ const catalogCache = new Map();
 const itemCache = new Map();
 const groupCache = new Map();
 
+const DANCES = [
+  {
+    Name: "Dance 1",
+    AnimationId: "rbxassetid://507771019",
+    Category: "Basic",
+    Rarity: "Common",
+    Price: 0,
+    Speed: 1
+  },
+  {
+    Name: "Dance 2",
+    AnimationId: "rbxassetid://507776043",
+    Category: "Basic",
+    Rarity: "Common",
+    Price: 0,
+    Speed: 1
+  },
+  {
+    Name: "Dance 3",
+    AnimationId: "rbxassetid://507777268",
+    Category: "Basic",
+    Rarity: "Common",
+    Price: 0,
+    Speed: 1
+  },
+  {
+    Name: "Robot",
+    AnimationId: "rbxassetid://507776720",
+    Category: "Basic",
+    Rarity: "Common",
+    Price: 0,
+    Speed: 1
+  },
+  {
+    Name: "Cheer",
+    AnimationId: "rbxassetid://507770677",
+    Category: "Basic",
+    Rarity: "Common",
+    Price: 0,
+    Speed: 1
+  },
+  {
+    Name: "Wave",
+    AnimationId: "rbxassetid://507770239",
+    Category: "Basic",
+    Rarity: "Common",
+    Price: 0,
+    Speed: 1
+  }
+];
+
 if (!global.fetch) {
   console.error("This backend requires Node 18+ because it uses the built-in fetch API.");
   process.exit(1);
@@ -837,6 +888,13 @@ app.get("/", (req, res) => {
   });
 });
 
+app.get("/dances", (req, res) => {
+  return res.json({
+    Success: true,
+    Items: DANCES
+  });
+});
+
 app.get("/catalog/search", async (req, res) => {
   try {
     const result = await searchCatalog({
@@ -1166,4 +1224,5 @@ app.listen(PORT, () => {
   console.log(`Catalog base URL: ${CATALOG_BASE_URL}`);
   console.log(`Groups base URL: ${GROUPS_BASE_URL}`);
   console.log(`Thumbnails base URL: ${THUMBNAILS_BASE_URL}`);
+  console.log(`Dance route: /dances`);
 });
