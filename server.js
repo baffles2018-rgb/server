@@ -12,15 +12,13 @@ const DB_PATH = path.resolve(process.env.DB_PATH || "./donations.db");
 const CATALOG_BASE_URL = String(process.env.CATALOG_BASE_URL || "https://catalog.roproxy.com").replace(/\/+$/, "");
 const ECONOMY_BASE_URL = String(process.env.ECONOMY_BASE_URL || "https://economy.roproxy.com").replace(/\/+$/, "");
 const MARKETPLACE_SALES_BASE_URL = String(process.env.MARKETPLACE_SALES_BASE_URL || "https://apis.roproxy.com/marketplace-sales").replace(/\/+$/, "");
-const GAMES_BASE_URL = String(process.env.GAMES_BASE_URL || "https://games.roproxy.com").replace(/\/+$/, "");
-const PASSES_BASE_URL = String(process.env.PASSES_BASE_URL || "https://apis.roproxy.com").replace(/\/+$/, "");
 const GROUPS_BASE_URL = String(process.env.GROUPS_BASE_URL || "https://groups.roproxy.com").replace(/\/+$/, "");
 const THUMBNAILS_BASE_URL = String(process.env.THUMBNAILS_BASE_URL || "https://thumbnails.roproxy.com").replace(/\/+$/, "");
 
 const ROBLOX_CREATOR_NAME = String(process.env.ROBLOX_CREATOR_NAME || "Roblox").trim();
 const ROBLOX_CREATOR_ID = Number(process.env.ROBLOX_CREATOR_ID || 1);
 
-const CATALOG_CACHE_TTL_MS = 20 * 1000;
+const CATALOG_CACHE_TTL_MS = 45 * 1000;
 const ITEM_CACHE_TTL_MS = 2 * 60 * 1000;
 const LIMITED_PRICE_CACHE_TTL_MS = 45 * 1000;
 const GROUP_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -40,7 +38,7 @@ const DANCES = [
 ];
 
 if (!global.fetch) {
-  console.error("This backend requires Node 18+ because it uses the built-in fetch API.");
+  console.error("This backend requires Node 18+.");
   process.exit(1);
 }
 
@@ -101,7 +99,6 @@ function sleep(ms) {
 
 async function fetchJson(url, options = {}) {
   const { timeoutMs = 10000, retries = 1 } = options;
-
   let lastError = null;
 
   for (let attempt = 0; attempt <= retries; attempt += 1) {
@@ -112,7 +109,7 @@ async function fetchJson(url, options = {}) {
       const response = await fetch(url, {
         method: "GET",
         headers: {
-          "User-Agent": "Mozilla/5.0 CatalogBackend/3.0",
+          "User-Agent": "Mozilla/5.0 RobloxCatalogBackend/5.0",
           "Accept": "application/json"
         },
         signal: controller.signal
@@ -141,7 +138,10 @@ async function fetchJson(url, options = {}) {
 
 function getCache(map, key) {
   const hit = map.get(key);
-  if (!hit) return null;
+
+  if (!hit) {
+    return null;
+  }
 
   if (Date.now() > hit.expiresAt) {
     map.delete(key);
@@ -174,21 +174,39 @@ function normalizeBool(value) {
   return value === true || value === "true" || value === "1" || value === 1;
 }
 
+function normalizeCategory(value) {
+  return String(value || "all")
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "");
+}
+
 function normalizeSortType(sort) {
   const value = String(sort || "Relevance").toLowerCase();
-  if (value === "pricelow") return 3;
-  if (value === "pricehigh") return 4;
+
+  if (value === "pricelow") {
+    return 3;
+  }
+
+  if (value === "pricehigh") {
+    return 4;
+  }
+
   return 0;
 }
 
 function getFallbackKeyword(category) {
-  const c = String(category || "all").toLowerCase();
+  const c = normalizeCategory(category);
 
   if (c === "accessories") return "hat horns accessory";
   if (c === "clothing") return "shirt pants clothing";
+  if (c === "classicshirts") return "classic shirt";
+  if (c === "classicpants") return "classic pants";
+  if (c === "classictshirts") return "classic t-shirt";
+  if (c === "layeredclothing") return "layered clothing";
   if (c === "body") return "face head body";
   if (c === "animations") return "animation emote";
   if (c === "bundles") return "bundle";
+
   return "avatar";
 }
 
@@ -201,6 +219,7 @@ function firstFiniteNumber(item, keys) {
     }
 
     const n = Number(value);
+
     if (Number.isFinite(n)) {
       return n;
     }
@@ -280,6 +299,16 @@ function normalizeAssetType(item) {
   ).trim();
 }
 
+function normalizeAssetTypeId(item) {
+  return Number(
+    item?.assetTypeId ??
+    item?.AssetTypeId ??
+    item?.assetType ??
+    item?.AssetType ??
+    0
+  ) || 0;
+}
+
 function normalizeBundleType(item) {
   return String(
     item?.bundleType ||
@@ -323,6 +352,7 @@ function detectLimited(item) {
   }
 
   const restrictions = getRestrictions(item);
+
   for (const restriction of restrictions) {
     if (String(restriction || "").toLowerCase().includes("limited")) {
       return true;
@@ -330,6 +360,7 @@ function detectLimited(item) {
   }
 
   const priceStatus = String(item?.priceStatus || item?.PriceStatus || "").toLowerCase();
+
   if (priceStatus.includes("limited")) {
     return true;
   }
@@ -366,11 +397,13 @@ function normalizeThumbnail(item) {
   }
 
   const id = Number(item?.id || item?.Id || item?.itemId || item?.ItemId || 0);
+
   if (!Number.isFinite(id) || id <= 0) {
     return "";
   }
 
   const itemType = normalizeItemType(item);
+
   if (itemType.toLowerCase() === "bundle") {
     return `rbxthumb://type=BundleThumbnail&id=${id}&w=420&h=420`;
   }
@@ -402,6 +435,8 @@ function buildTagsFromFlags(isLimited, robloxCreated) {
 
 function buildPriceInfo(item, options = {}) {
   const isLimited = options.isLimited ?? detectLimited(item);
+  const allowLimitedUnavailable = options.allowLimitedUnavailable === true;
+
   const rawStatus = String(item?.priceStatus || item?.PriceStatus || "").trim();
   const statusLower = rawStatus.toLowerCase();
 
@@ -424,20 +459,22 @@ function buildPriceInfo(item, options = {}) {
         Price: Math.floor(liveResalePrice),
         PriceText: formatRobux(liveResalePrice),
         PriceStatus: "Limited resale",
-        PriceSource: "live-resale-field",
+        PriceSource: "search-resale-field",
         PriceUpdatedAt: new Date().toISOString(),
         IsForSale: true
       };
     }
 
-    return {
-      Price: null,
-      PriceText: "Price unavailable",
-      PriceStatus: "Price unavailable",
-      PriceSource: "limited-needs-reseller-lookup",
-      PriceUpdatedAt: new Date().toISOString(),
-      IsForSale: false
-    };
+    if (allowLimitedUnavailable) {
+      return {
+        Price: null,
+        PriceText: "Price unavailable",
+        PriceStatus: "Price unavailable",
+        PriceSource: "limited-needs-detail",
+        PriceUpdatedAt: new Date().toISOString(),
+        IsForSale: false
+      };
+    }
   }
 
   const normalPrice = firstFiniteNumber(item, [
@@ -491,12 +528,16 @@ function buildPriceInfo(item, options = {}) {
   };
 }
 
-function normalizeCatalogItem(item) {
+function normalizeCatalogItem(item, options = {}) {
   const id = Number(item?.id || item?.Id || item?.itemId || item?.ItemId || 0);
   const itemType = normalizeItemType(item);
   const isLimited = detectLimited(item);
   const robloxCreated = isRobloxCreator(item);
-  const priceInfo = buildPriceInfo(item, { isLimited });
+
+  const priceInfo = buildPriceInfo(item, {
+    isLimited,
+    allowLimitedUnavailable: options.allowLimitedUnavailable === true
+  });
 
   return {
     Id: id,
@@ -513,6 +554,7 @@ function normalizeCatalogItem(item) {
     IsForSale: priceInfo.IsForSale,
     Thumbnail: normalizeThumbnail(item),
     AssetType: normalizeAssetType(item),
+    AssetTypeId: normalizeAssetTypeId(item),
     BundleType: normalizeBundleType(item),
     IsRobloxCreated: robloxCreated,
     IsLimited: isLimited,
@@ -527,6 +569,7 @@ function mergePriceInfo(item, priceInfo) {
   }
 
   const robloxCreated = item.IsRobloxCreated === true;
+  const isLimited = priceInfo.IsLimited === true || item.IsLimited === true;
 
   return {
     ...item,
@@ -536,15 +579,14 @@ function mergePriceInfo(item, priceInfo) {
     PriceSource: priceInfo.PriceSource,
     PriceUpdatedAt: priceInfo.PriceUpdatedAt,
     IsForSale: priceInfo.IsForSale,
-    IsLimited: priceInfo.IsLimited === true || item.IsLimited === true,
-    Tags: priceInfo.IsLimited === true || item.IsLimited === true
-      ? buildTagsFromFlags(true, robloxCreated)
-      : item.Tags
+    IsLimited: isLimited,
+    Tags: isLimited ? buildTagsFromFlags(true, robloxCreated) : item.Tags
   };
 }
 
 async function fetchCatalogItemDetailRaw(itemId) {
   const id = toPositiveInt(itemId, 0);
+
   if (!id) {
     return null;
   }
@@ -553,13 +595,20 @@ async function fetchCatalogItemDetailRaw(itemId) {
   singleUrl.searchParams.set("itemType", "Asset");
 
   try {
-    return await fetchJson(singleUrl.toString(), { timeoutMs: 7000, retries: 1 });
+    return await fetchJson(singleUrl.toString(), {
+      timeoutMs: 7000,
+      retries: 1
+    });
   } catch (singleError) {
     const batchUrl = new URL(`${CATALOG_BASE_URL}/v1/catalog/items/details`);
     batchUrl.searchParams.set("itemIds", String(id));
 
     try {
-      const data = await fetchJson(batchUrl.toString(), { timeoutMs: 7000, retries: 1 });
+      const data = await fetchJson(batchUrl.toString(), {
+        timeoutMs: 7000,
+        retries: 1
+      });
+
       const rows = Array.isArray(data.data) ? data.data : [];
       return rows[0] || null;
     } catch (batchError) {
@@ -571,6 +620,7 @@ async function fetchCatalogItemDetailRaw(itemId) {
 
 async function tryFetchLegacyResellerPrice(assetId) {
   const id = toPositiveInt(assetId, 0);
+
   if (!id) {
     return null;
   }
@@ -587,7 +637,11 @@ async function tryFetchLegacyResellerPrice(assetId) {
   url.searchParams.set("limit", "10");
 
   try {
-    const data = await fetchJson(url.toString(), { timeoutMs: 7000, retries: 1 });
+    const data = await fetchJson(url.toString(), {
+      timeoutMs: 7000,
+      retries: 1
+    });
+
     const rows = Array.isArray(data.data) ? data.data : [];
 
     const prices = rows
@@ -621,6 +675,7 @@ async function tryFetchLegacyResellerPrice(assetId) {
 
 async function tryFetchCollectibleResellerPrice(collectibleItemId) {
   const id = String(collectibleItemId || "").trim();
+
   if (!id) {
     return null;
   }
@@ -637,7 +692,11 @@ async function tryFetchCollectibleResellerPrice(collectibleItemId) {
   url.searchParams.set("limit", "10");
 
   try {
-    const data = await fetchJson(url.toString(), { timeoutMs: 7000, retries: 1 });
+    const data = await fetchJson(url.toString(), {
+      timeoutMs: 7000,
+      retries: 1
+    });
+
     const rows = Array.isArray(data.data) ? data.data : [];
 
     const prices = rows
@@ -669,7 +728,7 @@ async function tryFetchCollectibleResellerPrice(collectibleItemId) {
   }
 }
 
-async function enrichCatalogItemPrice(item) {
+async function enrichCatalogItemPriceForDetail(item) {
   if (!item || !item.Id) {
     return item;
   }
@@ -690,7 +749,9 @@ async function enrichCatalogItemPrice(item) {
     ItemId: id
   };
 
-  let enriched = normalizeCatalogItem(mergedRaw);
+  let enriched = normalizeCatalogItem(mergedRaw, {
+    allowLimitedUnavailable: true
+  });
 
   enriched = {
     ...item,
@@ -713,7 +774,7 @@ async function enrichCatalogItemPrice(item) {
 
   if (livePrice) {
     const finalItem = mergePriceInfo(enriched, livePrice);
-    console.log(`[CatalogPrice] final itemId=${finalItem.Id} name=${finalItem.Name} limited=${finalItem.IsLimited} price=${finalItem.PriceText} source=${finalItem.PriceSource}`);
+    console.log(`[CatalogPrice] detail final itemId=${finalItem.Id} name=${finalItem.Name} limited=${finalItem.IsLimited} price=${finalItem.PriceText} source=${finalItem.PriceSource}`);
     return finalItem;
   }
 
@@ -730,41 +791,12 @@ async function enrichCatalogItemPrice(item) {
       Tags: buildTagsFromFlags(true, enriched.IsRobloxCreated === true)
     };
 
-    console.log(`[CatalogPrice] final itemId=${finalItem.Id} name=${finalItem.Name} limited=true price=${finalItem.PriceText} source=${finalItem.PriceSource}`);
+    console.log(`[CatalogPrice] detail final itemId=${finalItem.Id} name=${finalItem.Name} limited=true price=${finalItem.PriceText} source=${finalItem.PriceSource}`);
     return finalItem;
   }
 
-  console.log(`[CatalogPrice] final itemId=${enriched.Id} name=${enriched.Name} limited=${enriched.IsLimited} price=${enriched.PriceText} source=${enriched.PriceSource}`);
+  console.log(`[CatalogPrice] detail final itemId=${enriched.Id} name=${enriched.Name} limited=${enriched.IsLimited} price=${enriched.PriceText} source=${enriched.PriceSource}`);
   return enriched;
-}
-
-async function mapWithConcurrency(items, limit, mapper) {
-  const output = new Array(items.length);
-  let index = 0;
-
-  async function worker() {
-    while (index < items.length) {
-      const currentIndex = index;
-      index += 1;
-      output[currentIndex] = await mapper(items[currentIndex], currentIndex);
-    }
-  }
-
-  const workerCount = Math.max(1, Math.min(limit, items.length));
-  await Promise.all(Array.from({ length: workerCount }, worker));
-
-  return output;
-}
-
-async function enrichCurrentPagePrices(items) {
-  return mapWithConcurrency(items, 4, async item => {
-    try {
-      return await enrichCatalogItemPrice(item);
-    } catch (error) {
-      console.warn(`[CatalogPrice] live price enrich failed itemId=${item?.Id} reason=${error.message}`);
-      return item;
-    }
-  });
 }
 
 function dedupeById(items) {
@@ -773,6 +805,7 @@ function dedupeById(items) {
 
   for (const item of items) {
     const id = Number(item?.Id || 0);
+
     if (!Number.isFinite(id) || id <= 0 || seen.has(id)) {
       continue;
     }
@@ -785,7 +818,7 @@ function dedupeById(items) {
 }
 
 function categoryMatches(item, category) {
-  const c = String(category || "all").toLowerCase();
+  const c = normalizeCategory(category);
 
   if (c === "all") {
     return true;
@@ -794,12 +827,20 @@ function categoryMatches(item, category) {
   const assetType = String(item.AssetType || "").toLowerCase();
   const itemType = String(item.ItemType || "").toLowerCase();
   const bundleType = String(item.BundleType || "").toLowerCase();
+  const assetTypeId = Number(item.AssetTypeId || 0);
   const haystack = `${String(item.Name || "").toLowerCase()} ${String(item.Description || "").toLowerCase()}`;
 
+  const accessoryIds = new Set([8, 41, 42, 43, 44, 45, 46, 47]);
+  const classicShirtIds = new Set([11]);
+  const classicPantsIds = new Set([12]);
+  const classicTShirtIds = new Set([2]);
+  const clothingIds = new Set([2, 11, 12]);
+  const bodyIds = new Set([17, 18, 27, 28, 29, 30, 31, 79]);
+  const animationIds = new Set([24, 48, 50, 51, 52, 53, 54, 55, 56]);
+  const layeredClothingIds = new Set([64, 65, 66, 67, 68, 69, 70, 71, 72]);
+
   if (c === "accessories") {
-    if (!assetType) {
-      return itemType !== "bundle";
-    }
+    if (accessoryIds.has(assetTypeId)) return true;
 
     return [
       "hat",
@@ -814,9 +855,7 @@ function categoryMatches(item, category) {
   }
 
   if (c === "clothing") {
-    if (!assetType) {
-      return haystack.includes("shirt") || haystack.includes("pants") || haystack.includes("clothing");
-    }
+    if (clothingIds.has(assetTypeId)) return true;
 
     return [
       "shirt",
@@ -825,13 +864,39 @@ function categoryMatches(item, category) {
       "classicshirt",
       "classicpants",
       "classictshirt"
+    ].includes(assetType) || haystack.includes("shirt") || haystack.includes("pants") || haystack.includes("clothing");
+  }
+
+  if (c === "classicshirts") {
+    return classicShirtIds.has(assetTypeId) || assetType === "shirt" || assetType === "classicshirt";
+  }
+
+  if (c === "classicpants") {
+    return classicPantsIds.has(assetTypeId) || assetType === "pants" || assetType === "classicpants";
+  }
+
+  if (c === "classictshirts") {
+    return classicTShirtIds.has(assetTypeId) || assetType === "tshirt" || assetType === "classictshirt";
+  }
+
+  if (c === "layeredclothing") {
+    if (layeredClothingIds.has(assetTypeId)) return true;
+
+    return [
+      "tshirtaccessory",
+      "shirtaccessory",
+      "pantsaccessory",
+      "jacketaccessory",
+      "sweateraccessory",
+      "shortsaccessory",
+      "dressskirtaccessory",
+      "leftshoeaccessory",
+      "rightshoeaccessory"
     ].includes(assetType);
   }
 
   if (c === "body") {
-    if (!assetType) {
-      return haystack.includes("face") || haystack.includes("head") || haystack.includes("body");
-    }
+    if (bodyIds.has(assetTypeId)) return true;
 
     return [
       "face",
@@ -840,14 +905,13 @@ function categoryMatches(item, category) {
       "leftarm",
       "rightarm",
       "leftleg",
-      "rightleg"
-    ].includes(assetType);
+      "rightleg",
+      "dynamichead"
+    ].includes(assetType) || haystack.includes("face") || haystack.includes("head") || haystack.includes("body");
   }
 
   if (c === "animations") {
-    if (!assetType) {
-      return haystack.includes("animation") || haystack.includes("emote") || haystack.includes("dance");
-    }
+    if (animationIds.has(assetTypeId)) return true;
 
     return [
       "runanimation",
@@ -859,17 +923,12 @@ function categoryMatches(item, category) {
       "swimanimation",
       "poseanimation",
       "emoteanimation"
-    ].includes(assetType);
+    ].includes(assetType) || haystack.includes("animation") || haystack.includes("emote") || haystack.includes("dance");
   }
 
   if (c === "bundles") {
-    if (itemType !== "bundle") {
-      return false;
-    }
-
-    if (!bundleType) {
-      return true;
-    }
+    if (itemType !== "bundle") return false;
+    if (!bundleType) return true;
 
     return ["bodyparts", "animations", "characters"].includes(bundleType);
   }
@@ -889,7 +948,10 @@ async function searchCatalogPage({ keyword, sort, limit, cursor, includeOffSale 
     url.searchParams.set("Cursor", cursor);
   }
 
-  return fetchJson(url.toString(), { timeoutMs: 9000, retries: 1 });
+  return fetchJson(url.toString(), {
+    timeoutMs: 9000,
+    retries: 1
+  });
 }
 
 async function searchCatalog({ search, category, sort, page, pageSize, robloxOnly }) {
@@ -904,10 +966,11 @@ async function searchCatalog({ search, category, sort, page, pageSize, robloxOnl
     page: requestedPage,
     pageSize: safePageSize,
     robloxOnly: !!robloxOnly,
-    version: "accurate-prices-v3"
+    version: "fast-search-detail-pricing-v1"
   });
 
   const cached = getCache(catalogCache, cacheKey);
+
   if (cached) {
     return cached;
   }
@@ -931,7 +994,10 @@ async function searchCatalog({ search, category, sort, page, pageSize, robloxOnl
     });
 
     const rows = Array.isArray(data.data) ? data.data : [];
-    let normalized = rows.map(normalizeCatalogItem);
+
+    let normalized = rows.map(row => normalizeCatalogItem(row, {
+      allowLimitedUnavailable: false
+    }));
 
     if (robloxOnly) {
       normalized = normalized.filter(item => item.IsRobloxCreated);
@@ -950,8 +1016,7 @@ async function searchCatalog({ search, category, sort, page, pageSize, robloxOnl
 
   const deduped = dedupeById(collected);
   const startIndex = (requestedPage - 1) * safePageSize;
-  const pageItems = deduped.slice(startIndex, startIndex + safePageSize);
-  const items = await enrichCurrentPagePrices(pageItems);
+  const items = deduped.slice(startIndex, startIndex + safePageSize);
 
   const result = {
     success: true,
@@ -973,6 +1038,7 @@ async function getCatalogItemDetails(itemId) {
   }
 
   const cached = getCache(itemCache, String(id));
+
   if (cached) {
     return cached;
   }
@@ -985,9 +1051,11 @@ async function getCatalogItemDetails(itemId) {
     Id: id,
     itemId: id,
     ItemId: id
+  }, {
+    allowLimitedUnavailable: true
   });
 
-  item = await enrichCatalogItemPrice(item);
+  item = await enrichCatalogItemPriceForDetail(item);
 
   const ttl = item.IsLimited ? LIMITED_PRICE_CACHE_TTL_MS : ITEM_CACHE_TTL_MS;
   setCache(itemCache, String(id), item, ttl);
@@ -997,7 +1065,11 @@ async function getCatalogItemDetails(itemId) {
 
 async function getUserGroups(userId) {
   const url = `${GROUPS_BASE_URL}/v2/users/${encodeURIComponent(userId)}/groups/roles`;
-  const data = await fetchJson(url, { timeoutMs: 9000, retries: 1 });
+  const data = await fetchJson(url, {
+    timeoutMs: 9000,
+    retries: 1
+  });
+
   return Array.isArray(data.data) ? data.data : [];
 }
 
@@ -1016,12 +1088,17 @@ async function getGroupThumbnails(groupIds) {
   url.searchParams.set("format", "Png");
   url.searchParams.set("isCircular", "false");
 
-  const data = await fetchJson(url.toString(), { timeoutMs: 9000, retries: 1 });
+  const data = await fetchJson(url.toString(), {
+    timeoutMs: 9000,
+    retries: 1
+  });
+
   const rows = Array.isArray(data.data) ? data.data : [];
   const out = new Map();
 
   for (const row of rows) {
     const id = Number(row.targetId || row.groupId || 0);
+
     if (!Number.isFinite(id) || id <= 0) {
       continue;
     }
@@ -1319,9 +1396,11 @@ app.get("/catalog/debug/item/:id", async (req, res) => {
       Id: id,
       itemId: id,
       ItemId: id
+    }, {
+      allowLimitedUnavailable: true
     });
 
-    const finalItem = await enrichCatalogItemPrice(normalizedBeforeLive);
+    const finalItem = await enrichCatalogItemPriceForDetail(normalizedBeforeLive);
 
     return res.json({
       success: true,
