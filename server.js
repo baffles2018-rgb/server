@@ -10,6 +10,7 @@ const API_KEY = String(process.env.API_KEY || "").trim();
 const DB_PATH = path.resolve(process.env.DB_PATH || "./donations.db");
 
 const CATALOG_BASE_URL = String(process.env.CATALOG_BASE_URL || "https://catalog.roproxy.com").replace(/\/+$/, "");
+const ECONOMY_BASE_URL = String(process.env.ECONOMY_BASE_URL || "https://economy.roproxy.com").replace(/\/+$/, "");
 const GAMES_BASE_URL = String(process.env.GAMES_BASE_URL || "https://games.roproxy.com").replace(/\/+$/, "");
 const PASSES_BASE_URL = String(process.env.PASSES_BASE_URL || "https://apis.roproxy.com").replace(/\/+$/, "");
 const GROUPS_BASE_URL = String(process.env.GROUPS_BASE_URL || "https://groups.roproxy.com").replace(/\/+$/, "");
@@ -18,12 +19,14 @@ const THUMBNAILS_BASE_URL = String(process.env.THUMBNAILS_BASE_URL || "https://t
 const ROBLOX_CREATOR_NAME = String(process.env.ROBLOX_CREATOR_NAME || "Roblox").trim();
 const ROBLOX_CREATOR_ID = Number(process.env.ROBLOX_CREATOR_ID || 1);
 
-const CATALOG_CACHE_TTL_MS = 60 * 1000;
-const ITEM_CACHE_TTL_MS = 5 * 60 * 1000;
+const CATALOG_CACHE_TTL_MS = 30 * 1000;
+const ITEM_CACHE_TTL_MS = 2 * 60 * 1000;
+const LIMITED_PRICE_CACHE_TTL_MS = 45 * 1000;
 const GROUP_CACHE_TTL_MS = 5 * 60 * 1000;
 
 const catalogCache = new Map();
 const itemCache = new Map();
+const priceCache = new Map();
 const groupCache = new Map();
 
 const DANCES = [
@@ -310,9 +313,139 @@ function normalizeThumbnail(item) {
   return `rbxthumb://type=Asset&id=${id}&w=420&h=420`;
 }
 
-function normalizePrice(item) {
-  const n = Number(item?.price ?? item?.lowestPrice ?? 0);
-  return Number.isFinite(n) ? n : 0;
+function firstFiniteNumber(item, keys) {
+  for (const key of keys) {
+    const value = item?.[key];
+    if (value === null || value === undefined || value === "") {
+      continue;
+    }
+
+    const n = Number(value);
+    if (Number.isFinite(n)) {
+      return n;
+    }
+  }
+
+  return null;
+}
+
+function formatRobux(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) {
+    return "Price unavailable";
+  }
+
+  if (n <= 0) {
+    return "Free";
+  }
+
+  return `${Math.floor(n).toLocaleString("en-US")} R$`;
+}
+
+function buildPriceInfo(item, options = {}) {
+  const isLimited = options.isLimited ?? detectLimited(item);
+  const rawStatus = String(item?.priceStatus || item?.PriceStatus || "").trim();
+  const statusLower = rawStatus.toLowerCase();
+
+  const liveResalePrice = firstFiniteNumber(item, [
+    "CollectibleLowestResalePrice",
+    "collectibleLowestResalePrice",
+    "lowestResalePrice",
+    "LowestResalePrice",
+    "lowestAvailableResalePrice",
+    "LowestAvailableResalePrice",
+    "lowestAvailablePrice",
+    "LowestAvailablePrice",
+    "bestPrice",
+    "BestPrice"
+  ]);
+
+  if (isLimited) {
+    if (liveResalePrice !== null && liveResalePrice > 0) {
+      return {
+        Price: Math.floor(liveResalePrice),
+        PriceText: formatRobux(liveResalePrice),
+        PriceStatus: "Limited resale",
+        PriceSource: "live-resale-field",
+        PriceUpdatedAt: new Date().toISOString(),
+        IsForSale: true
+      };
+    }
+
+    const possibleLowestPrice = firstFiniteNumber(item, [
+      "lowestPrice",
+      "LowestPrice"
+    ]);
+
+    if (possibleLowestPrice !== null && possibleLowestPrice > 0) {
+      return {
+        Price: Math.floor(possibleLowestPrice),
+        PriceText: formatRobux(possibleLowestPrice),
+        PriceStatus: "Limited resale",
+        PriceSource: "catalog-lowest-price",
+        PriceUpdatedAt: new Date().toISOString(),
+        IsForSale: true
+      };
+    }
+
+    return {
+      Price: null,
+      PriceText: "Price unavailable",
+      PriceStatus: "Price unavailable",
+      PriceSource: "limited-unavailable",
+      PriceUpdatedAt: new Date().toISOString(),
+      IsForSale: false
+    };
+  }
+
+  const normalPrice = firstFiniteNumber(item, [
+    "price",
+    "Price",
+    "priceInRobux",
+    "PriceInRobux",
+    "lowestPrice",
+    "LowestPrice"
+  ]);
+
+  const explicitlyForSale = item?.isForSale === true || item?.IsForSale === true;
+  const explicitlyOffsale =
+    item?.isForSale === false ||
+    item?.IsForSale === false ||
+    statusLower.includes("off") ||
+    statusLower.includes("unavailable") ||
+    statusLower.includes("not for sale");
+
+  if (explicitlyOffsale && normalPrice === null) {
+    return {
+      Price: null,
+      PriceText: "Offsale",
+      PriceStatus: rawStatus || "Offsale",
+      PriceSource: "offsale",
+      PriceUpdatedAt: new Date().toISOString(),
+      IsForSale: false
+    };
+  }
+
+  if (normalPrice !== null) {
+    const price = Math.max(0, Math.floor(normalPrice));
+    return {
+      Price: price,
+      PriceText: formatRobux(price),
+      PriceStatus: rawStatus || (price === 0 ? "Free" : "On sale"),
+      PriceSource: "catalog-price",
+      PriceUpdatedAt: new Date().toISOString(),
+      IsForSale: explicitlyForSale || !explicitlyOffsale
+    };
+  }
+
+  return {
+    Price: null,
+    PriceText: explicitlyOffsale ? "Offsale" : "Price unavailable",
+    PriceStatus: rawStatus || (explicitlyOffsale ? "Offsale" : "Price unavailable"),
+    PriceSource: explicitlyOffsale ? "offsale" : "unavailable",
+    PriceUpdatedAt: new Date().toISOString(),
+    IsForSale: false
+  };
 }
 
 function normalizeDescription(item) {
@@ -360,13 +493,8 @@ function buildTags(item) {
 function normalizeCatalogItem(item) {
   const id = Number(item?.id || item?.itemId || 0);
   const itemType = normalizeItemType(item);
-  const price = normalizePrice(item);
-  const priceStatus = String(item?.priceStatus || "").trim();
-  const isForSale =
-    item?.isForSale === true ||
-    priceStatus === "" ||
-    /^onsale$/i.test(priceStatus) ||
-    price >= 0;
+  const isLimited = detectLimited(item);
+  const priceInfo = buildPriceInfo(item, { isLimited });
 
   return {
     Id: id,
@@ -381,14 +509,17 @@ function normalizeCatalogItem(item) {
       item?.creator?.creatorTargetId ??
       0
     ) || 0,
-    Price: price,
-    PriceStatus: priceStatus,
-    IsForSale: isForSale,
+    Price: priceInfo.Price,
+    PriceText: priceInfo.PriceText,
+    PriceStatus: priceInfo.PriceStatus,
+    PriceSource: priceInfo.PriceSource,
+    PriceUpdatedAt: priceInfo.PriceUpdatedAt,
+    IsForSale: priceInfo.IsForSale,
     Thumbnail: normalizeThumbnail(item),
     AssetType: normalizeAssetType(item),
     BundleType: normalizeBundleType(item),
     IsRobloxCreated: isRobloxCreator(item),
-    IsLimited: detectLimited(item),
+    IsLimited: isLimited,
     Tags: buildTags(item)
   };
 }
@@ -408,6 +539,138 @@ function dedupeById(items) {
   }
 
   return out;
+}
+
+function mergePriceInfo(item, priceInfo) {
+  if (!item || !priceInfo) {
+    return item;
+  }
+
+  return {
+    ...item,
+    Price: priceInfo.Price,
+    PriceText: priceInfo.PriceText,
+    PriceStatus: priceInfo.PriceStatus,
+    PriceSource: priceInfo.PriceSource,
+    PriceUpdatedAt: priceInfo.PriceUpdatedAt,
+    IsForSale: priceInfo.IsForSale
+  };
+}
+
+async function fetchLimitedResalePrice(assetId) {
+  const id = toPositiveInt(assetId, 0);
+  if (!id) {
+    return {
+      Price: null,
+      PriceText: "Price unavailable",
+      PriceStatus: "Price unavailable",
+      PriceSource: "invalid-id",
+      PriceUpdatedAt: new Date().toISOString(),
+      IsForSale: false
+    };
+  }
+
+  const cacheKey = `limited_resale_${id}`;
+  const cached = getCache(priceCache, cacheKey);
+  if (cached) {
+    console.log(`[CatalogPrice] using cached price itemId=${id} price=${cached.PriceText}`);
+    return cached;
+  }
+
+  const url = new URL(`${ECONOMY_BASE_URL}/v1/assets/${encodeURIComponent(id)}/resellers`);
+  url.searchParams.set("limit", "10");
+
+  try {
+    const data = await fetchJson(url.toString(), { timeoutMs: 5000, retries: 0 });
+    const rows = Array.isArray(data.data) ? data.data : [];
+    const prices = rows
+      .map(row => Number(row?.price ?? row?.Price ?? row?.sellerPrice ?? 0))
+      .filter(price => Number.isFinite(price) && price > 0);
+
+    if (prices.length > 0) {
+      const lowest = Math.min(...prices);
+      const result = {
+        Price: Math.floor(lowest),
+        PriceText: formatRobux(lowest),
+        PriceStatus: "Limited resale",
+        PriceSource: "economy-resellers",
+        PriceUpdatedAt: new Date().toISOString(),
+        IsForSale: true
+      };
+
+      console.log(`[CatalogPrice] itemId=${id} limited=true price=${result.PriceText} source=${result.PriceSource}`);
+      setCache(priceCache, cacheKey, result, LIMITED_PRICE_CACHE_TTL_MS);
+      return result;
+    }
+
+    const result = {
+      Price: null,
+      PriceText: "No resellers",
+      PriceStatus: "No resellers",
+      PriceSource: "economy-resellers-empty",
+      PriceUpdatedAt: new Date().toISOString(),
+      IsForSale: false
+    };
+
+    console.log(`[CatalogPrice] limited price unavailable itemId=${id} reason=no-resellers`);
+    setCache(priceCache, cacheKey, result, LIMITED_PRICE_CACHE_TTL_MS);
+    return result;
+  } catch (error) {
+    const result = {
+      Price: null,
+      PriceText: "Price unavailable",
+      PriceStatus: "Price unavailable",
+      PriceSource: "economy-resellers-error",
+      PriceUpdatedAt: new Date().toISOString(),
+      IsForSale: false
+    };
+
+    console.warn(`[CatalogPrice] limited price unavailable itemId=${id} reason=${error.message}`);
+    setCache(priceCache, cacheKey, result, 15 * 1000);
+    return result;
+  }
+}
+
+async function enrichLimitedItemPrice(item) {
+  if (!item || !item.IsLimited) {
+    return item;
+  }
+
+  if (String(item.ItemType || "").toLowerCase() === "bundle") {
+    return item;
+  }
+
+  const livePrice = await fetchLimitedResalePrice(item.Id);
+  return mergePriceInfo(item, livePrice);
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const output = new Array(items.length);
+  let index = 0;
+
+  async function worker() {
+    while (index < items.length) {
+      const currentIndex = index;
+      index += 1;
+
+      output[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  }
+
+  const workerCount = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workerCount }, worker));
+  return output;
+}
+
+async function enrichLimitedPrices(items) {
+  return mapWithConcurrency(items, 6, async item => {
+    try {
+      return await enrichLimitedItemPrice(item);
+    } catch (error) {
+      console.warn(`[CatalogPrice] stale/unavailable price kept itemId=${item?.Id} reason=${error.message}`);
+      return item;
+    }
+  });
 }
 
 function categoryMatches(item, category) {
@@ -573,7 +836,8 @@ async function searchCatalog({ search, category, sort, page, pageSize, robloxOnl
 
   const deduped = dedupeById(collected);
   const startIndex = (requestedPage - 1) * safePageSize;
-  const items = deduped.slice(startIndex, startIndex + safePageSize);
+  const pageItems = deduped.slice(startIndex, startIndex + safePageSize);
+  const items = await enrichLimitedPrices(pageItems);
 
   const result = {
     success: true,
@@ -608,8 +872,11 @@ async function getCatalogItemDetails(itemId) {
     return null;
   }
 
-  const item = normalizeCatalogItem(rows[0]);
-  setCache(itemCache, String(id), item, ITEM_CACHE_TTL_MS);
+  let item = normalizeCatalogItem(rows[0]);
+  item = await enrichLimitedItemPrice(item);
+
+  const ttl = item.IsLimited ? LIMITED_PRICE_CACHE_TTL_MS : ITEM_CACHE_TTL_MS;
+  setCache(itemCache, String(id), item, ttl);
   return item;
 }
 
@@ -1222,6 +1489,7 @@ app.listen(PORT, () => {
   console.log(`Listening on port ${PORT}`);
   console.log(`Using SQLite database at: ${DB_PATH}`);
   console.log(`Catalog base URL: ${CATALOG_BASE_URL}`);
+  console.log(`Economy base URL: ${ECONOMY_BASE_URL}`);
   console.log(`Groups base URL: ${GROUPS_BASE_URL}`);
   console.log(`Thumbnails base URL: ${THUMBNAILS_BASE_URL}`);
   console.log(`Dance route: /dances`);
